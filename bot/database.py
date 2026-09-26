@@ -517,11 +517,103 @@ class Database:
                         break
             return out
 
+    def get_digest_stats(self, guild_id: int, days: int = 7) -> dict[str, Any]:
+        """Сводка по серверу за последние `days` дней для авто-дайджеста и команды /digest."""
+        days = max(1, int(days))
+        since_expr = f"-{days} days"
+        with self._session() as conn:
+            total_violations = conn.execute(
+                """SELECT COUNT(*) AS n FROM violations
+                   WHERE guild_id = ? AND created_at >= datetime('now', ?)""",
+                (guild_id, since_expr),
+            ).fetchone()["n"]
+
+            dismissed_count = conn.execute(
+                """SELECT COUNT(*) AS n FROM punishments
+                   WHERE guild_id = ? AND action = 'dismiss'
+                     AND created_at >= datetime('now', ?)""",
+                (guild_id, since_expr),
+            ).fetchone()["n"]
+
+            skipped_count = conn.execute(
+                """SELECT COUNT(*) AS n FROM punishments
+                   WHERE guild_id = ? AND action = 'skip'
+                     AND created_at >= datetime('now', ?)""",
+                (guild_id, since_expr),
+            ).fetchone()["n"]
+
+            actions_rows = conn.execute(
+                """SELECT action, COUNT(*) AS c FROM punishments
+                   WHERE guild_id = ? AND action NOT IN ('dismiss', 'skip')
+                     AND created_at >= datetime('now', ?)
+                   GROUP BY action ORDER BY c DESC""",
+                (guild_id, since_expr),
+            ).fetchall()
+
+            top_rules = conn.execute(
+                """SELECT v.rule_id, COUNT(*) AS c FROM violations v
+                   WHERE v.guild_id = ? AND v.created_at >= datetime('now', ?)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM punishments p
+                         WHERE p.violation_id = v.id AND p.action = 'dismiss'
+                     )
+                   GROUP BY v.rule_id ORDER BY c DESC LIMIT 5""",
+                (guild_id, since_expr),
+            ).fetchall()
+
+            top_mods = conn.execute(
+                """SELECT moderator_id, COUNT(*) AS c FROM punishments
+                   WHERE guild_id = ? AND moderator_id IS NOT NULL
+                     AND created_at >= datetime('now', ?)
+                   GROUP BY moderator_id ORDER BY c DESC LIMIT 5""",
+                (guild_id, since_expr),
+            ).fetchall()
+
+            return {
+                "days": days,
+                "total_violations": total_violations,
+                "real_violations": max(0, total_violations - dismissed_count),
+                "dismissed": dismissed_count,
+                "skipped": skipped_count,
+                "actions": {r["action"]: r["c"] for r in actions_rows},
+                "top_rules": [(r["rule_id"], r["c"]) for r in top_rules],
+                "top_mods": [(r["moderator_id"], r["c"]) for r in top_mods],
+            }
+
+    def export_guild_records(self, guild_id: int, days: int = 30, limit: int = 5000) -> list[dict[str, Any]]:
+        """Выгружает нарушения вместе с решениями модераторов за последние `days` дней (для CSV /export)."""
+        days = max(1, int(days))
+        since_expr = f"-{days} days"
+        with self._session() as conn:
+            rows = conn.execute(
+                """SELECT
+                       v.id AS violation_id,
+                       v.created_at AS violation_time,
+                       v.user_id,
+                       v.channel_id,
+                       v.rule_id,
+                       v.severity,
+                       v.method,
+                       v.original_text,
+                       v.translated_text,
+                       p.action AS mod_action,
+                       p.duration_seconds,
+                       p.moderator_id,
+                       p.status AS punishment_status,
+                       p.created_at AS decision_time
+                   FROM violations v
+                   LEFT JOIN punishments p ON p.violation_id = v.id
+                   WHERE v.guild_id = ? AND v.created_at >= datetime('now', ?)
+                   ORDER BY v.id DESC LIMIT ?""",
+                (guild_id, since_expr, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
 
 _db = Database()
 
 
-
 def get_db() -> Database:
     return _db
+
 

@@ -214,7 +214,7 @@ servers = cur.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
 violations = cur.execute("SELECT COUNT(*) FROM violations").fetchone()[0]
 punishments = cur.execute("SELECT COUNT(*) FROM punishments WHERE action != 'dismiss'").fetchone()[0]
 dismissed = cur.execute("SELECT COUNT(*) FROM punishments WHERE action = 'dismiss'").fetchone()[0]
-banwords = cur.execute("SELECT COUNT(*) FROM banwords").fetchone()[0]
+banwords = cur.execute("SELECT COUNT(*) FROM banned_words").fetchone()[0]
 print(f"Серверов в БД:          {servers}")
 print(f"Всего нарушений:        {violations}")
 print(f"Вынесено наказаний:     {punishments}")

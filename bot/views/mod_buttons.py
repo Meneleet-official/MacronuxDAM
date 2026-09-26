@@ -53,6 +53,23 @@ class TimeoutModal(ui.Modal):
         await self._cb(interaction, self.duration.value)
 
 
+class NickModal(ui.Modal):
+    def __init__(self, callback, default_nick: str = ""):
+        super().__init__(title="Смена никнейма участника")
+        self._cb = callback
+        self.new_nick = ui.TextInput(
+            label="Новый никнейм (пусто — сбросить серверный)",
+            placeholder=default_nick or "Участник",
+            default=default_nick or None,
+            required=False,
+            max_length=32,
+        )
+        self.add_item(self.new_nick)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._cb(interaction, (self.new_nick.value or "").strip())
+
+
 class ModActionView(ui.View):
     """Персистентные кнопки решения по нарушению (#violation_id в custom_id).
 
@@ -62,7 +79,8 @@ class ModActionView(ui.View):
     """
 
     def __init__(self, guild_id: int, user_id: int, violation_id: int, target_msg_id: int = None,
-                 channel_id: int = None, lang: str = "ru", suggest: dict = None):
+                 channel_id: int = None, lang: str = "ru", suggest: dict = None,
+                 show_nick_btn: bool = False, reporter_id: int = None):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.user_id = user_id
@@ -71,6 +89,8 @@ class ModActionView(ui.View):
         self.channel_id = channel_id
         self.lang = lang
         self.suggest = suggest or {}
+        self.show_nick_btn = show_nick_btn
+        self.reporter_id = reporter_id
         self._build_buttons()
 
     @staticmethod
@@ -98,6 +118,12 @@ class ModActionView(ui.View):
         self._make("ban", self._suggest_label("ban", "🔨 Бан"),
                    discord.ButtonStyle.danger, self.ban_cb, row=0)
         self._make("skip", "➡️ Пропустить", discord.ButtonStyle.success, self.skip_cb, row=1)
+        if self.show_nick_btn:
+            self._make("nick", "✏️ Сменить ник", discord.ButtonStyle.primary, self.nick_cb, row=1)
+        if self.reporter_id:
+            self._make("falsereport", "⚠️ Ложный вызов (п. 2.5)", discord.ButtonStyle.danger,
+                       self.falsereport_cb, row=1)
+
 
     def _perm(self, interaction: discord.Interaction, action: str = "delete") -> bool:
         perms = getattr(interaction.user, "guild_permissions", None)
@@ -263,6 +289,93 @@ class ModActionView(ui.View):
         await self._mark_punished(interaction, "Не нарушение (панель снята)")
         await self._log_punishment(interaction, "dismiss", status="dismissed")
 
+    async def nick_cb(self, interaction: discord.Interaction):
+        """Кнопка «✏️ Сменить ник» в панелях нарушений профиля (п. 2.2, 2.3, 3.7)."""
+        if not self._perm(interaction, "timeout"):
+            await self._denied(interaction, "timeout")
+            return
+        default_nick = f"Участник #{str(self.user_id)[-4:]}"
+        modal = NickModal(self._handle_nick, default_nick=default_nick)
+        await interaction.response.send_modal(modal)
+
+    async def _handle_nick(self, interaction: discord.Interaction, new_nick: str):
+        member = await self._resolve_member(interaction.guild)
+        if not member:
+            await interaction.response.send_message("Пользователь вне сервера.", ephemeral=True)
+            return
+        target_nick = new_nick if new_nick else None
+        try:
+            await member.edit(nick=target_nick, reason=f"Violation #{self.violation_id} (п. 3.7 / 2.2)")
+            label_nick = f"«{target_nick}»" if target_nick else "сброшен (по умолчанию)"
+            await interaction.response.send_message(
+                f"Никнейм {member.mention} изменён: **{label_nick}**.", ephemeral=True
+            )
+            await self._mark_punished(interaction, "Смена никнейма", label_nick)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Недостаточно прав у бота для смены никнейма (роль бота должна быть выше роли участника).",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"Ошибка Discord API: {e}", ephemeral=True)
+
+    async def falsereport_cb(self, interaction: discord.Interaction):
+        """Кнопка «⚠️ Ложный вызов (п. 2.5)» — наказывает автора ложной жалобы тайм-аутом на 60 минут."""
+        if not self._perm(interaction, "timeout"):
+            await self._denied(interaction, "timeout")
+            return
+        reporter_uid = self.reporter_id
+        if not reporter_uid:
+            # Пробуем извлечь ID жалобщика из текста нарушения, если кнопка нажата после рестарта
+            from bot.database import get_db
+            v = get_db().get_violation(self.violation_id)
+            if v and v.get("original_text"):
+                m = re.search(r"reporter_id=(\d+)", v["original_text"])
+                if m:
+                    reporter_uid = int(m.group(1))
+        if not reporter_uid:
+            await interaction.response.send_message("Не удалось определить автора жалобы.", ephemeral=True)
+            return
+        reporter = interaction.guild.get_member(reporter_uid)
+        if reporter is None:
+            try:
+                reporter = await interaction.guild.fetch_member(reporter_uid)
+            except (discord.NotFound, discord.HTTPException):
+                reporter = None
+        if not reporter:
+            await interaction.response.send_message("Автор жалобы уже покинул сервер.", ephemeral=True)
+            return
+        try:
+            delta = timedelta(minutes=60)
+            await reporter.timeout(delta, reason=f"Правило 2.5: Ложный вызов модерации (Report #{self.violation_id})")
+            from bot.database import get_db
+            db = get_db()
+            rep_vid = db.add_violation(
+                self.guild_id, reporter.id,
+                rule_id="2.5", severity="medium", method="manual_report",
+                message_snapshot="Ложная жалоба / злоупотребление /report",
+                original_text="Ложная жалоба / злоупотребление /report",
+                channel_id=self.channel_id or 0, message_id=0,
+            )
+            db.add_punishment(
+                self.guild_id, reporter.id, violation_id=rep_vid,
+                moderator_id=interaction.user.id, action="timeout", duration_seconds=3600,
+            )
+            await interaction.response.send_message(
+                f"Жалоба отклонена как ложная. Автору жалобы {reporter.mention} выдан тайм-аут **60м** по **п. 2.5**.",
+                ephemeral=True,
+            )
+            await self._mark_punished(
+                interaction, "Ложный вызов (п. 2.5)", f"Тайм-аут 60м автору жалобы {reporter.mention}"
+            )
+            await self._log_punishment(interaction, "dismiss", status="dismissed")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Недостаточно прав для выдачи тайм-аута автору жалобы.", ephemeral=True
+            )
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"Ошибка Discord API: {e}", ephemeral=True)
+
     # ---- helpers ----
     async def _handle_timeout(self, interaction: discord.Interaction, duration_str: str):
         seconds = parse_duration(duration_str, default_unit="m")
@@ -412,6 +525,192 @@ class ModActionView(ui.View):
         return punishment_id
 
 
+class RaidActionView(ui.View):
+    """Боевые кнопки для панели Анти-Рейда (Пункт 2.6 «Набеги и рейды»):
+      1) 🔨 Забанить всю волну рейда (в 1 клик банит всех участников из списка всплеска);
+      2) 🔒 Пауза инвайтов / Локдаун (30 мин);
+      3) ✖️ Ложная тревога.
+    """
+
+    def __init__(self, guild_id: int, violation_id: int, raider_ids: list[int]):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.violation_id = violation_id
+        self.raider_ids = list(dict.fromkeys(raider_ids))
+
+        btn_ban = ui.Button(
+            label=f"🔨 Забанить всю волну ({len(self.raider_ids)})",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"raid:{violation_id}:banwave",
+            row=0,
+        )
+        btn_ban.callback = self.ban_wave_cb
+        self.add_item(btn_ban)
+
+        btn_lock = ui.Button(
+            label="🔒 Пауза инвайтов (30 мин)",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"raid:{violation_id}:lockdown",
+            row=0,
+        )
+        btn_lock.callback = self.lockdown_cb
+        self.add_item(btn_lock)
+
+        btn_dismiss = ui.Button(
+            label="✖️ Ложная тревога",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"raid:{violation_id}:dismiss",
+            row=0,
+        )
+        btn_dismiss.callback = self.dismiss_raid_cb
+        self.add_item(btn_dismiss)
+
+    def _has_perm(self, interaction: discord.Interaction, action: str = "ban") -> bool:
+        v = ModActionView(self.guild_id, 0, self.violation_id)
+        return v._perm(interaction, action)
+
+    async def ban_wave_cb(self, interaction: discord.Interaction):
+        if not self._has_perm(interaction, "ban"):
+            await interaction.response.send_message(
+                "Недостаточно прав (требуется Ban Members / Роль модерации / Administrator).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        from bot.database import get_db
+        db = get_db()
+        banned = 0
+        failed = 0
+        for uid in self.raider_ids:
+            try:
+                await interaction.guild.ban(
+                    discord.Object(id=uid),
+                    reason=f"Анти-рейд п. 2.6 (Волна #{self.violation_id})",
+                    delete_message_days=1,
+                )
+                db.add_punishment(
+                    self.guild_id, uid,
+                    violation_id=self.violation_id,
+                    moderator_id=interaction.user.id,
+                    action="ban",
+                    duration_seconds=0,
+                    status="applied",
+                )
+                banned += 1
+            except discord.HTTPException:
+                failed += 1
+        try:
+            if interaction.message and interaction.message.embeds:
+                embed = discord.Embed.from_dict(interaction.message.embeds[0].to_dict())
+                stamp = _time.strftime("%d.%m %H:%M")
+                embed.add_field(
+                    name="⚖ Волна рейда заблокирована",
+                    value=(
+                        f"Забанено: **{banned}** из {len(self.raider_ids)} "
+                        f"{f'(ошибок: {failed})' if failed else ''}\n"
+                        f"Модератор: {interaction.user.mention} · {stamp}"
+                    ),
+                    inline=False,
+                )
+                embed.color = discord.Color(BRAND_GREEN)
+                for child in self.children:
+                    if isinstance(child, ui.Button) and "banwave" in (child.custom_id or ""):
+                        child.disabled = True
+                await interaction.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(
+            f"🔨 Волна рейда обработана: забанено **{banned}** аккаунтов (п. 2.6).",
+            ephemeral=True,
+        )
+
+    async def lockdown_cb(self, interaction: discord.Interaction):
+        if not self._has_perm(interaction, "timeout"):
+            await interaction.response.send_message("Недостаточно прав для включения защиты.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        paused_invites = False
+        slowmode_channels = 0
+        # 1. Пытаемся поставить на паузу приглашения Discord (invites_disabled)
+        try:
+            await guild.edit(invites_disabled=True, reason=f"Анти-рейд локдаун (30 мин) от {interaction.user}")
+            paused_invites = True
+        except (discord.Forbidden, discord.HTTPException, TypeError):
+            paused_invites = False
+
+        # 2. Дополнительно включаем медленный режим (10 сек) в текстовых каналах без slowmode
+        changed_channels = []
+        for ch in guild.text_channels:
+            if ch.slowmode_delay == 0 and ch.permissions_for(guild.me).manage_channels:
+                try:
+                    await ch.edit(slowmode_delay=10, reason="Анти-рейд защита (30 мин)")
+                    changed_channels.append(ch.id)
+                    slowmode_channels += 1
+                except discord.HTTPException:
+                    pass
+
+        details = []
+        if paused_invites:
+            details.append("инвайты поставлены на паузу")
+        if slowmode_channels:
+            details.append(f"медленный режим (10с) включён в {slowmode_channels} каналах")
+        if not details:
+            await interaction.followup.send(
+                "Не удалось включить паузу инвайтов (проверьте права Manage Guild / Manage Channels у бота).",
+                ephemeral=True,
+            )
+            return
+
+        summary = ", ".join(details) + " на 30 минут"
+        await interaction.followup.send(f"🔒 Защита включена: {summary}.", ephemeral=True)
+
+        async def _lift_lockdown():
+            await asyncio.sleep(1800)
+            if paused_invites:
+                try:
+                    await guild.edit(invites_disabled=False, reason="Авто-снятие анти-рейд паузы (30 мин)")
+                except Exception:
+                    pass
+            for cid in changed_channels:
+                ch_obj = guild.get_channel(cid)
+                if ch_obj and ch_obj.slowmode_delay == 10:
+                    try:
+                        await ch_obj.edit(slowmode_delay=0, reason="Авто-снятие анти-рейд slowmode")
+                    except Exception:
+                        pass
+
+        asyncio.create_task(_lift_lockdown())
+
+    async def dismiss_raid_cb(self, interaction: discord.Interaction):
+        if not self._has_perm(interaction, "dismiss"):
+            await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+            return
+        from bot.database import get_db
+        get_db().add_punishment(
+            self.guild_id, 0,
+            violation_id=self.violation_id,
+            moderator_id=interaction.user.id,
+            action="dismiss",
+            status="dismissed",
+        )
+        try:
+            if interaction.message and interaction.message.embeds:
+                embed = discord.Embed.from_dict(interaction.message.embeds[0].to_dict())
+                embed.color = discord.Color(BRAND_GREEN)
+                embed.add_field(
+                    name="⚖ Статус",
+                    value=f"**Ложная тревога (снято)** — {interaction.user.mention}",
+                    inline=False,
+                )
+                for child in self.children:
+                    if isinstance(child, ui.Button):
+                        child.disabled = True
+                await interaction.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message("Панель анти-рейда снята.", ephemeral=True)
+
 
 class DynamicModButton(
     ui.DynamicItem[ui.Button],
@@ -458,12 +757,14 @@ class DynamicModButton(
             target_msg_id=v.get("message_id"),
             channel_id=v.get("channel_id"),
             suggest=suggest,
+            show_nick_btn=(self.action == "nick"),
         )
         handler = getattr(view, f"{self.action}_cb", None)
         if handler is None:
             await interaction.response.send_message("Неизвестное действие.", ephemeral=True)
             return
         await handler(interaction)
+
 
 
 def parse_duration(value: str, default_unit: str = "m") -> int:

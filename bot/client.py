@@ -9,7 +9,7 @@ from discord.ext import commands
 
 from bot import akemi, llm, moderation, messages, translator
 from bot.database import get_db
-from bot.views.mod_buttons import DynamicModButton, ModActionView
+from bot.views.mod_buttons import DynamicModButton, ModActionView, RaidActionView
 
 # Очередь модерации: message-объекты проверяются в фоне ограниченным числом
 # воркеров, чтобы LLM-вызовы не блокировали event loop Discord и не упирались
@@ -17,6 +17,8 @@ from bot.views.mod_buttons import DynamicModButton, ModActionView
 MODERATION_WORKERS = 2
 MODERATION_QUEUE_MAX = 512
 UNBAN_CHECK_INTERVAL = 60  # сек — проверка истёкших временных банов по БД
+WEEKLY_DIGEST_INTERVAL = 7 * 86400  # 7 суток — еженедельный авто-дайджест для Главной Администрации
+NEW_ACCOUNT_HOURS = 48     # аккаунты младше 48 часов помечаются как подозрительные на твинк (п. 2.1)
 
 RECENT_MESSAGES: dict = defaultdict(lambda: deque(maxlen=20))
 # Панели по пользователям: (guild_id, user_id) -> (канал_панели, id_панели,
@@ -69,7 +71,6 @@ PROFILE_ALERT_COOLDOWN = 300  # сек между панелями по одно
 SPLIT_MSG_WINDOW = 20         # сек для склейки разбитых по словам оскорблений/банвордов
 
 
-
 class ModBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -77,7 +78,15 @@ class ModBot(commands.Bot):
         intents.members = True
         intents.messages = True
         intents.moderation = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            status=discord.Status.dnd,
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="за порядком Macronux™",
+            ),
+        )
         self._mod_queue: asyncio.Queue = asyncio.Queue(maxsize=MODERATION_QUEUE_MAX)
         self._bg_tasks: list[asyncio.Task] = []
 
@@ -125,17 +134,40 @@ class ModBot(commands.Bot):
         await self.load_extension("bot.cogs.stats")
         await self.load_extension("bot.cogs.rules_cmd")
         await self.load_extension("bot.cogs.rescan")
+        await self.load_extension("bot.cogs.reports")
         await self.tree.sync()
         for guild in self.guilds:
             try:
                 await self.tree.sync(guild=guild)
             except discord.HTTPException as e:
                 print(f"[SYNC] guild {guild.id}: {e}")
-        # Фоновые задачи: сброс прогресса сканирования, авто-разбан и воркеры очереди модерации.
+        # Фоновые задачи: сброс прогресса сканирования, авто-разбан, авто-дайджест и воркеры очереди.
         self._bg_tasks.append(self.loop.create_task(self._scan_flush_loop()))
         self._bg_tasks.append(self.loop.create_task(self._unban_loop()))
+        self._bg_tasks.append(self.loop.create_task(self._weekly_digest_loop()))
         for i in range(MODERATION_WORKERS):
             self._bg_tasks.append(self.loop.create_task(self._moderation_worker(i)))
+
+    async def _weekly_digest_loop(self):
+        """Еженедельный авто-дайджест для Главной Администрации в канал модерации."""
+        from bot.cogs.stats import build_digest_embed
+        while True:
+            await asyncio.sleep(WEEKLY_DIGEST_INTERVAL)
+            db = get_db()
+            for guild in list(self.guilds):
+                try:
+                    server = db.get_server(guild.id)
+                    channel = _resolve_mod_channel(guild, server.get("mod_channel_id"))
+                    if channel is None:
+                        continue
+                    stats = db.get_digest_stats(guild.id, days=7)
+                    if stats.get("total_violations", 0) == 0:
+                        continue
+                    embed = build_digest_embed(guild, days=7)
+                    await channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[DIGEST] ошибка авто-дайджеста для {guild.id}: {e}")
+
 
     async def _scan_flush_loop(self):
         """Периодический сброс маркера сканирования каналов в БД."""
@@ -274,6 +306,16 @@ class ModBot(commands.Bot):
 
     async def on_ready(self):
         print(f"Бот запущен: {self.user} (id={self.user.id})")
+        try:
+            await self.change_presence(
+                status=discord.Status.dnd,
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name="за порядком Macronux™",
+                ),
+            )
+        except Exception as e:
+            print(f"[PRESENCE] не удалось выставить статус DND: {e}")
         await akemi.detect(self)
         if not getattr(self, "_backfill_done", False):
             self._backfill_done = True
@@ -396,7 +438,8 @@ class ModBot(commands.Bot):
         await self._check_member_profile_violation(after)
 
     async def _check_member_profile_violation(self, member: discord.Member):
-        """Проверяет профиль участника на нарушение правил 2.2, 2.3, 3.7 и публикует панель модерации."""
+        """Проверяет профиль участника на нарушение правил 2.2, 2.3, 3.7,
+        автоматически сбрасывает запрещённый никнейм и публикует панель модерации."""
         db = get_db()
         server = db.get_server(member.guild.id)
         guild_banwords = db.list_banwords(member.guild.id)
@@ -410,10 +453,26 @@ class ModBot(commands.Bot):
         if now - RECENT_PROFILE_ALERTS.get(alert_key, 0) < PROFILE_ALERT_COOLDOWN:
             return
         RECENT_PROFILE_ALERTS[alert_key] = now
+
+        old_display = getattr(member, "display_name", "") or str(member)
+        auto_renamed = None
+        # Если нарушение в отображаемом имени/никнейме — сразу переименовываем нарушителя
+        if "статусе" not in (res.reason or "") and hasattr(member, "edit"):
+            fallback_nick = f"Участник #{str(member.id)[-4:]}"
+            try:
+                await member.edit(
+                    nick=fallback_nick,
+                    reason=f"Авто-сброс запрещённого никнейма (п. {res.rule_id}): {old_display[:40]}",
+                )
+                auto_renamed = fallback_nick
+            except (discord.Forbidden, discord.HTTPException):
+                auto_renamed = None
+
         print(f"[PROFILE-VIOLATION] {res.rule_id} ({res.severity}) у {member}: {res.reason}")
         try:
             await post_profile_violation_panel(
-                member, server, res.rule_id, res.method, res.severity, res.reason
+                member, server, res.rule_id, res.method, res.severity, res.reason,
+                old_display_name=old_display, auto_renamed=auto_renamed,
             )
         except Exception as e:
             print(f"[PROFILE-PANEL] ошибка: {e}")
@@ -432,6 +491,16 @@ class ModBot(commands.Bot):
         rule_id, method, severity, reason, translation = detect
         print(f"[VIOLATION] {rule_id} ({method}/{severity}) от {message.author}: {message.content[:60]!r}")
 
+        # Мгновенный карантин: скам-ссылки/инвайты (3.3) и деанон/личные данные (3.4)
+        # удаляются из чата СРАЗУ ЖЕ (даже до ожидания Akemi и даже если delete_message=False),
+        # чтобы никто из участников не перешёл по фишингу и не увидел чужие личные данные.
+        force_quarantine = rule_id in ("3.3", "3.4")
+        if force_quarantine:
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
+
         # Совместимость с Akemi: если он уже наказал/удалил это нарушение — не дублируем.
         if akemi.resolved_id() is not None:
             await asyncio.sleep(AKEMI_SETTLE)
@@ -440,7 +509,7 @@ class ModBot(commands.Bot):
                 SCAN_PROGRESS[(message.guild.id, message.channel.id)] = message.id
                 return
         # Decision on auto-delete
-        delete_msg = bool(server.get("delete_message"))
+        delete_msg = bool(server.get("delete_message")) or force_quarantine
         target_lang = server.get("target_language") or "ru"
 
         # Build moderation panel (перевод уже готов из объединённого LLM-вызова)
@@ -453,12 +522,13 @@ class ModBot(commands.Bot):
             print(f"[ERROR] обработка нарушений: {type(e).__name__}: {e}")
             traceback.print_exc()
 
-        if delete_msg:
+        if delete_msg and not force_quarantine:
             try:
                 await message.delete()
             except (discord.Forbidden, discord.NotFound):
                 pass
         SCAN_PROGRESS[(message.guild.id, message.channel.id)] = message.id
+
 
     async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
         akemi.cache_from_entry(entry)
@@ -637,22 +707,25 @@ def flood_count(message: discord.Message) -> int:
 
 
 
+def _account_age_hours(user) -> float | None:
+    """Возвращает возраст Discord-аккаунта в часах (или None, если created_at недоступен)."""
+    created_at = getattr(user, "created_at", None)
+    if created_at is None:
+        return None
+    try:
+        now_ts = time.time()
+        return max(0.0, (now_ts - created_at.timestamp()) / 3600.0)
+    except Exception:
+        return None
+
+
 async def post_violation_panel(message, server, rule_id, method, severity, reason,
                                target_lang, delete_msg, mod_channel_id, translation=None):
     db = get_db()
     guild = message.guild
 
     # Ensure mod channel exists
-    channel = None
-    if mod_channel_id:
-        channel = guild.get_channel(mod_channel_id)
-    if channel is None:
-        for ch in guild.text_channels:
-            if "mod" in ch.name.lower() or "мод" in ch.name.lower() or "модер" in ch.name.lower():
-                channel = ch
-                break
-    if channel is None:
-        channel = guild.system_channel
+    channel = _resolve_mod_channel(guild, mod_channel_id)
     if channel is None:
         print(f"[PANEL] ВНИМАНИЕ: канал модерации не найден "
               f"(mod_channel_id={mod_channel_id}, system={guild.system_channel})")
@@ -661,6 +734,14 @@ async def post_violation_panel(message, server, rule_id, method, severity, reaso
           f"send={channel.permissions_for(guild.me).send_messages}")
 
     lang = target_lang or "ru"
+
+    # Детектор возраста аккаунта (Account Age < 48 ч. -> подозрение на твинк п. 2.1)
+    age_hours = _account_age_hours(message.author)
+    is_new_account = age_hours is not None and age_hours < NEW_ACCOUNT_HOURS
+    if is_new_account and severity == "medium":
+        severity = "high"
+    elif is_new_account and severity == "low":
+        severity = "medium"
 
     if translation:
         translated = translation
@@ -709,11 +790,21 @@ async def post_violation_panel(message, server, rule_id, method, severity, reaso
                      icon_url=message.author.display_avatar.url)
 
     # Участник
+    member_val = f"{message.author.mention} · <#{message.channel.id}>"
+    if rule_id in ("3.3", "3.4"):
+        member_val += "\n🛡️ *Сообщение мгновенно удалено карантином*"
     embed.add_field(
         name=messages.t(lang, "member_field"),
-        value=f"{message.author.mention} · <#{message.channel.id}>",
+        value=member_val,
         inline=False,
     )
+
+    if is_new_account:
+        embed.add_field(
+            name="⚠️ Новый аккаунт (подозрение на твинк п. 2.1)",
+            value=f"Аккаунт создан **{max(1, int(age_hours))} ч. назад** (< {NEW_ACCOUNT_HOURS} ч.).",
+            inline=False,
+        )
 
     # Сообщение + перевод одной строкой (лимит поля эмбеда — 1024 символа)
     msg_val = snip(message.content or "(вложения)", limit=900)
@@ -843,8 +934,16 @@ def _resolve_mod_channel(guild: discord.Guild, mod_channel_id: int | None):
     return channel
 
 
-async def post_profile_violation_panel(member: discord.Member, server: dict,
-                                       rule_id: str, method: str, severity: str, reason: str):
+async def post_profile_violation_panel(
+    member: discord.Member,
+    server: dict,
+    rule_id: str,
+    method: str,
+    severity: str,
+    reason: str,
+    old_display_name: str = None,
+    auto_renamed: str = None,
+):
     """Отправляет панель модерации по нарушению в профиле/никнейме/статусе (правила 2.2, 2.3, 3.7)."""
     db = get_db()
     guild = member.guild
@@ -853,10 +952,13 @@ async def post_profile_violation_panel(member: discord.Member, server: dict,
         return
 
     lang = server.get("target_language") or "ru"
+    shown_name = old_display_name or member.display_name
     status_text = moderation._extract_member_status(member)
-    profile_snapshot = f"Никнейм: {member.display_name} ({member})"
+    profile_snapshot = f"Никнейм: {shown_name} ({member})"
     if status_text:
         profile_snapshot += f" | Статус: {status_text}"
+    if auto_renamed:
+        profile_snapshot += f"\n✅ Авто-переименован ботом в: «{auto_renamed}»"
 
     violation_id = db.add_violation(
         guild.id, member.id,
@@ -879,7 +981,7 @@ async def post_profile_violation_panel(member: discord.Member, server: dict,
     primary_action, primary_secs = suggest["action"], suggest.get("primary_secs")
     recommendation = (
         f"**{action_label(primary_action)} {fmt_duration(primary_secs)}**"
-        if primary_secs else f"**{action_label(primary_action)}**"
+        if (primary_secs or primary_action == "ban") else f"**{action_label(primary_action)}**"
     )
 
     embed = discord.Embed(
@@ -888,15 +990,22 @@ async def post_profile_violation_panel(member: discord.Member, server: dict,
     )
     if getattr(member, "display_avatar", None):
         embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_author(name=f"{member.display_name} ({member})", icon_url=member.display_avatar.url)
+        embed.set_author(name=f"{shown_name} ({member})", icon_url=member.display_avatar.url)
     else:
-        embed.set_author(name=f"{member.display_name} ({member})")
+        embed.set_author(name=f"{shown_name} ({member})")
 
     embed.add_field(
         name=messages.t(lang, "member_field"),
         value=f"{member.mention} · Профиль участника",
         inline=False,
     )
+    age_hours = _account_age_hours(member)
+    if age_hours is not None and age_hours < NEW_ACCOUNT_HOURS:
+        embed.add_field(
+            name="⚠️ Новый аккаунт (подозрение на твинк п. 2.1)",
+            value=f"Аккаунт создан **{max(1, int(age_hours))} ч. назад** (< {NEW_ACCOUNT_HOURS} ч.).",
+            inline=False,
+        )
     embed.add_field(
         name="Профиль / Статус",
         value=snip(profile_snapshot, limit=900),
@@ -916,6 +1025,7 @@ async def post_profile_violation_panel(member: discord.Member, server: dict,
         guild.id, member.id, violation_id,
         target_msg_id=None, channel_id=channel.id,
         lang=lang, suggest=suggest,
+        show_nick_btn=True,
     )
     try:
         await channel.send(embed=embed, view=view)
@@ -925,14 +1035,13 @@ async def post_profile_violation_panel(member: discord.Member, server: dict,
 
 async def post_raid_alert_panel(guild: discord.Guild, trigger_member: discord.Member,
                                 raiders: list[tuple[float, int, str]]):
-    """Отправляет экстренную панель Анти-Рейда (правило 2.6: Набеги и рейды) с пингом роли модерации."""
+    """Отправляет экстренную панель Анти-Рейда (правило 2.6: Набеги и рейды) с боевыми кнопками и пингом."""
     db = get_db()
     server = db.get_server(guild.id)
     channel = _resolve_mod_channel(guild, server.get("mod_channel_id"))
     if channel is None:
         return
 
-    lang = server.get("target_language") or "ru"
     raider_lines = [f"• <@{uid}> (`{name}`)" for _, uid, name in raiders[-15:]]
     snapshot = f"Массовый вход ({len(raiders)} чел. за {RAID_WINDOW} сек.): " + ", ".join(
         name for _, _, name in raiders[-10:]
@@ -950,15 +1059,15 @@ async def post_raid_alert_panel(guild: discord.Guild, trigger_member: discord.Me
         channel_id=channel.id,
         message_id=0,
     )
-    from bot.rules import RULES, build_suggest
+    from bot.rules import RULES
     rule_info = RULES.get("2.6", {"title": "Набеги и рейды"})
-    suggest = build_suggest("2.6", 1, "high")
 
     embed = discord.Embed(
         title=f"🚨🚨 АНТИ-РЕЙД: Подозрение на набег (№{violation_id})",
         description=(
             f"Зафиксирован резкий всплеск входов: **{len(raiders)} участников за {RAID_WINDOW} сек.**\n"
-            f"По правилу **2.6 ({rule_info['title']})** за организацию и участие в рейдах предусмотрен **Перманентный бан**."
+            f"По правилу **2.6 ({rule_info['title']})** за организацию и участие в рейдах предусмотрен **Перманентный бан**.\n"
+            f"Используйте кнопки ниже для мгновенного бана всей волны или включения паузы инвайтов."
         ),
         color=discord.Color(BRAND_RED),
     )
@@ -972,13 +1081,11 @@ async def post_raid_alert_panel(guild: discord.Guild, trigger_member: discord.Me
     mod_role = guild.get_role(server.get("mod_role_id")) if server.get("mod_role_id") else None
     ping_content = f"🚨 {mod_role.mention} — обнаружен возможный рейд ({len(raiders)} входов за {RAID_WINDOW}с)!" if mod_role else None
 
-    view = ModActionView(
-        guild.id, trigger_member.id, violation_id,
-        target_msg_id=None, channel_id=channel.id,
-        lang=lang, suggest=suggest,
-    )
+    raider_ids = [uid for _, uid, _ in raiders]
+    view = RaidActionView(guild.id, violation_id, raider_ids)
     try:
         await channel.send(content=ping_content, embed=embed, view=view)
     except discord.HTTPException as e:
         print(f"[RAID-PANEL] ошибка отправки: {e}")
+
 
