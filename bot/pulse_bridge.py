@@ -95,6 +95,8 @@ class BridgeSnapshot:
         self.violation_ids: set[int] = set()
         self.punishment_ids: set[int] = set()
         self.punishments_by_vid: dict[int, tuple[str, int, str]] = {}
+        self.manual_punishment_sigs: set[tuple] = set()
+        self.web_action_ids: set[int] = set()
         self.banwords: set[tuple[int, str]] = set()
         self.exceptions: set[tuple[int, int, str]] = set()
 
@@ -585,43 +587,111 @@ class PulseBridge:
                         main_conn.execute("DELETE FROM violations WHERE id = ?", (vid,))
                     log.info("[PULSE] Из веб-панели удалено/сброшено нарушений: %d шт.", len(deleted_vids))
 
-                # 1c. Новые или изменённые вердикты модерации из веб-панели (actionDecide в Pulse)
+                # 1c. Новые или изменённые вердикты модерации из веб-панели (по нарушению ИЛИ прямые ручные наказания)
                 b_puns = bridge_conn.execute(
                     "SELECT * FROM punishments ORDER BY id ASC"
                 ).fetchall()
                 for pr in b_puns:
-                    vid = pr["violation_id"]
-                    if vid is None:
-                        continue
-                    vid = int(vid)
-                    sig = (
-                        str(pr["action"] or ""),
-                        int(pr["duration_seconds"] or 0),
-                        str(pr["status"] or "applied"),
-                    )
-                    if snap.punishments_by_vid.get(vid) != sig and int(pr["moderator_id"] or 0) == 0:
-                        main_conn.execute("DELETE FROM punishments WHERE violation_id = ?", (vid,))
+                    pr_d = dict(pr)
+                    vid = pr_d.get("violation_id")
+                    mod_id = int(pr_d.get("moderator_id") or 0)
+                    st = str(pr_d.get("status") or "applied")
+                    if vid is not None and int(vid) > 0:
+                        vid_int = int(vid)
+                        sig = (
+                            str(pr_d.get("action") or ""),
+                            int(pr_d.get("duration_seconds") or 0),
+                            st,
+                        )
+                        if snap.punishments_by_vid.get(vid_int) != sig and (mod_id == 0 or st == "pending"):
+                            main_conn.execute("DELETE FROM punishments WHERE violation_id = ?", (vid_int,))
+                            main_conn.execute(
+                                """INSERT INTO punishments
+                                   (guild_id, user_id, user_name, user_display_name, user_avatar_url,
+                                    violation_id, moderator_id, moderator_name, moderator_display_name,
+                                    action, duration_seconds, reason, status, created_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    pr_d.get("guild_id"),
+                                    pr_d.get("user_id"),
+                                    pr_d.get("user_name"),
+                                    pr_d.get("user_display_name"),
+                                    pr_d.get("user_avatar_url"),
+                                    vid_int,
+                                    pr_d.get("moderator_name") or "pulse_web",
+                                    pr_d.get("moderator_display_name") or "Веб-панель Pulse",
+                                    pr_d.get("action"),
+                                    pr_d.get("duration_seconds") or 0,
+                                    pr_d.get("reason"),
+                                    st,
+                                    pr_d.get("created_at"),
+                                ),
+                            )
+                    elif mod_id == 0 or st == "pending":
+                        # Прямое (ручное) наказание из веб-панели без привязки к старому violation_id
+                        msig = (
+                            int(pr_d.get("guild_id") or 0),
+                            int(pr_d.get("user_id") or 0),
+                            str(pr_d.get("action") or ""),
+                            int(pr_d.get("duration_seconds") or 0),
+                            str(pr_d.get("reason") or ""),
+                            str(pr_d.get("created_at") or ""),
+                        )
+                        if msig not in snap.manual_punishment_sigs and int(pr_d["id"]) not in snap.punishment_ids:
+                            main_conn.execute(
+                                """INSERT INTO punishments
+                                   (guild_id, user_id, user_name, user_display_name, user_avatar_url,
+                                    violation_id, moderator_id, moderator_name, moderator_display_name,
+                                    action, duration_seconds, reason, status, created_at)
+                                   VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    pr_d.get("guild_id"),
+                                    pr_d.get("user_id"),
+                                    pr_d.get("user_name"),
+                                    pr_d.get("user_display_name"),
+                                    pr_d.get("user_avatar_url"),
+                                    pr_d.get("moderator_name") or "pulse_web",
+                                    pr_d.get("moderator_display_name") or "Веб-панель Pulse",
+                                    pr_d.get("action"),
+                                    pr_d.get("duration_seconds") or 0,
+                                    pr_d.get("reason"),
+                                    st,
+                                    pr_d.get("created_at"),
+                                ),
+                            )
+
+                # 1d. Очередь команд web_actions из веб-панели Pulse
+                b_actions = bridge_conn.execute(
+                    "SELECT * FROM web_actions WHERE status = 'pending' ORDER BY id ASC"
+                ).fetchall()
+                for wa in b_actions:
+                    wa_d = dict(wa)
+                    if int(wa_d["id"]) not in snap.web_action_ids:
                         main_conn.execute(
-                            """INSERT INTO punishments
-                               (guild_id, user_id, user_name, user_display_name, user_avatar_url,
-                                violation_id, moderator_id, moderator_name, moderator_display_name,
-                                action, duration_seconds, status, created_at)
-                               VALUES (?, ?, ?, ?, ?, ?, 0, 'pulse_web', 'Веб-панель Pulse', ?, ?, ?, ?)""",
+                            """INSERT INTO web_actions (
+                                   guild_id, user_id, violation_id, rule_id, action,
+                                   duration_seconds, reason, new_nick,
+                                   moderator_id, moderator_name, moderator_display_name,
+                                   status, created_at
+                               )
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', COALESCE(?, datetime('now')))""",
                             (
-                                pr["guild_id"],
-                                pr["user_id"],
-                                pr["user_name"],
-                                pr["user_display_name"],
-                                pr["user_avatar_url"],
-                                vid,
-                                pr["action"],
-                                pr["duration_seconds"] or 0,
-                                pr["status"] or "applied",
-                                pr["created_at"],
+                                wa_d.get("guild_id"),
+                                wa_d.get("user_id"),
+                                wa_d.get("violation_id"),
+                                wa_d.get("rule_id"),
+                                wa_d.get("action"),
+                                wa_d.get("duration_seconds") or 0,
+                                wa_d.get("reason"),
+                                wa_d.get("new_nick"),
+                                wa_d.get("moderator_id") or 0,
+                                wa_d.get("moderator_name") or "pulse_web",
+                                wa_d.get("moderator_display_name") or "Веб-панель Pulse",
+                                wa_d.get("created_at"),
                             ),
                         )
 
-                # 1d. Серверные банворды (добавленные/удалённые в веб-панели Pulse)
+                # 1e. Серверные банворды (добавленные/удалённые в веб-панели Pulse)
                 b_words = {
                     (int(r["guild_id"]), str(r["word"]))
                     for r in bridge_conn.execute("SELECT guild_id, word FROM banned_words").fetchall()
@@ -637,7 +707,7 @@ class PulseBridge:
                         (gid_val, w),
                     )
 
-                # 1e. Исключения правил по каналам (добавленные/удалённые в веб-панели Pulse)
+                # 1f. Исключения правил по каналам (добавленные/удалённые в веб-панели Pulse)
                 b_ex = {
                     (int(r["guild_id"]), int(r["channel_id"]), str(r["rule"]))
                     for r in bridge_conn.execute(
@@ -660,20 +730,21 @@ class PulseBridge:
                 # При первой инициализации: если в контейнере уже были настройки серверов/банворды/решения,
                 # бережно переносим их в основную БД без удаления данных бота.
                 for r in bridge_conn.execute("SELECT * FROM servers").fetchall():
+                    r_d = dict(r)
                     main_conn.execute(
                         """INSERT OR IGNORE INTO servers
                            (guild_id, mod_channel_id, mod_role_id, target_language,
                             delete_message, llm_enabled, strike_thresholds, manual_strikes)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
-                            r["guild_id"],
-                            r["mod_channel_id"],
-                            r["mod_role_id"],
-                            r["target_language"] or "ru",
-                            r["delete_message"] or 0,
-                            r["llm_enabled"] if r["llm_enabled"] is not None else 1,
-                            r["strike_thresholds"] or "{}",
-                            r["manual_strikes"] or 0,
+                            r_d["guild_id"],
+                            r_d.get("mod_channel_id"),
+                            r_d.get("mod_role_id"),
+                            r_d.get("target_language") or "ru",
+                            r_d.get("delete_message") or 0,
+                            r_d.get("llm_enabled") if r_d.get("llm_enabled") is not None else 1,
+                            r_d.get("strike_thresholds") or "{}",
+                            r_d.get("manual_strikes") or 0,
                         ),
                     )
                 for r in bridge_conn.execute("SELECT guild_id, word FROM banned_words").fetchall():
@@ -685,6 +756,32 @@ class PulseBridge:
                     main_conn.execute(
                         "INSERT OR IGNORE INTO rule_exceptions (guild_id, channel_id, rule) VALUES (?, ?, ?)",
                         (r["guild_id"], r["channel_id"], r["rule"]),
+                    )
+                # Переносим ожидающие команды из web_actions, если их создали, пока бот перезапускался
+                for wa in bridge_conn.execute("SELECT * FROM web_actions WHERE status = 'pending'").fetchall():
+                    wa_d = dict(wa)
+                    main_conn.execute(
+                        """INSERT INTO web_actions (
+                               guild_id, user_id, violation_id, rule_id, action,
+                               duration_seconds, reason, new_nick,
+                               moderator_id, moderator_name, moderator_display_name,
+                               status, created_at
+                           )
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', COALESCE(?, datetime('now')))""",
+                        (
+                            wa_d.get("guild_id"),
+                            wa_d.get("user_id"),
+                            wa_d.get("violation_id"),
+                            wa_d.get("rule_id"),
+                            wa_d.get("action"),
+                            wa_d.get("duration_seconds") or 0,
+                            wa_d.get("reason"),
+                            wa_d.get("new_nick"),
+                            wa_d.get("moderator_id") or 0,
+                            wa_d.get("moderator_name") or "pulse_web",
+                            wa_d.get("moderator_display_name") or "Веб-панель Pulse",
+                            wa_d.get("created_at"),
+                        ),
                     )
                 main_conn.commit()
 
@@ -719,15 +816,15 @@ class PulseBridge:
                         r.get("guild_name"),
                         r.get("guild_icon_url"),
                         r.get("member_count") or 0,
-                        r["mod_channel_id"],
+                        r.get("mod_channel_id"),
                         r.get("mod_channel_name"),
                         r.get("mod_role_id"),
                         r.get("mod_role_name"),
-                        r["target_language"],
-                        r["delete_message"],
-                        r["llm_enabled"],
-                        r["strike_thresholds"],
-                        r["manual_strikes"],
+                        r.get("target_language") or "ru",
+                        r.get("delete_message") or 0,
+                        r.get("llm_enabled") if r.get("llm_enabled") is not None else 1,
+                        r.get("strike_thresholds") or "{}",
+                        r.get("manual_strikes") or 0,
                         r.get("updated_at"),
                     ),
                 )
@@ -742,9 +839,10 @@ class PulseBridge:
                            id, guild_id, guild_name, user_id, user_name, user_display_name, user_avatar_url,
                            rule_id, severity, method, reason, message_snapshot,
                            original_text, translated_text, detected_language,
-                           channel_id, channel_name, message_id, jump_url, attachments_json, created_at
+                           channel_id, channel_name, message_id, panel_channel_id, panel_message_id,
+                           jump_url, attachments_json, created_at
                        )
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET
                            guild_name = COALESCE(excluded.guild_name, violations.guild_name),
                            user_name = COALESCE(excluded.user_name, violations.user_name),
@@ -752,6 +850,8 @@ class PulseBridge:
                            user_avatar_url = COALESCE(excluded.user_avatar_url, violations.user_avatar_url),
                            reason = COALESCE(excluded.reason, violations.reason),
                            channel_name = COALESCE(excluded.channel_name, violations.channel_name),
+                           panel_channel_id = COALESCE(excluded.panel_channel_id, violations.panel_channel_id),
+                           panel_message_id = COALESCE(excluded.panel_message_id, violations.panel_message_id),
                            jump_url = COALESCE(excluded.jump_url, violations.jump_url),
                            attachments_json = COALESCE(excluded.attachments_json, violations.attachments_json)""",
                     (
@@ -762,20 +862,22 @@ class PulseBridge:
                         r.get("user_name"),
                         r.get("user_display_name"),
                         r.get("user_avatar_url"),
-                        r["rule_id"],
-                        r["severity"],
-                        r["method"],
+                        r.get("rule_id"),
+                        r.get("severity"),
+                        r.get("method"),
                         r.get("reason"),
-                        r["message_snapshot"],
-                        r["original_text"],
-                        r["translated_text"],
-                        r["detected_language"],
-                        r["channel_id"],
+                        r.get("message_snapshot"),
+                        r.get("original_text"),
+                        r.get("translated_text"),
+                        r.get("detected_language"),
+                        r.get("channel_id"),
                         r.get("channel_name"),
-                        r["message_id"],
+                        r.get("message_id"),
+                        r.get("panel_channel_id"),
+                        r.get("panel_message_id"),
                         r.get("jump_url"),
                         r.get("attachments_json"),
-                        r["created_at"],
+                        r.get("created_at"),
                     ),
                 )
             for stale_vid in b_vid_set - m_vid_set:
@@ -799,16 +901,16 @@ class PulseBridge:
                         r.get("user_name"),
                         r.get("user_display_name"),
                         r.get("user_avatar_url"),
-                        r["violation_id"],
-                        r["moderator_id"],
+                        r.get("violation_id"),
+                        r.get("moderator_id"),
                         r.get("moderator_name"),
                         r.get("moderator_display_name"),
                         r.get("moderator_avatar_url"),
-                        r["action"],
-                        r["duration_seconds"],
+                        r.get("action"),
+                        r.get("duration_seconds"),
                         r.get("reason"),
-                        r["status"],
-                        r["created_at"],
+                        r.get("status"),
+                        r.get("created_at"),
                     ),
                 )
 
@@ -889,7 +991,7 @@ class PulseBridge:
                     ),
                 )
 
-            # 2e. banned_words & rule_exceptions
+            # 2e. banned_words, rule_exceptions & web_actions
             m_words = [dict(r) for r in main_conn.execute("SELECT * FROM banned_words").fetchall()]
             bridge_conn.execute("DELETE FROM banned_words")
             for r in m_words:
@@ -906,6 +1008,37 @@ class PulseBridge:
                     (r["guild_id"], r["channel_id"], r["rule"]),
                 )
 
+            m_actions = [dict(r) for r in main_conn.execute("SELECT * FROM web_actions ORDER BY id ASC").fetchall()]
+            bridge_conn.execute("DELETE FROM web_actions")
+            for r in m_actions:
+                bridge_conn.execute(
+                    """INSERT INTO web_actions (
+                           id, guild_id, user_id, violation_id, rule_id, action,
+                           duration_seconds, reason, new_nick,
+                           moderator_id, moderator_name, moderator_display_name,
+                           status, result_message, created_at, executed_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        r["id"],
+                        r["guild_id"],
+                        r["user_id"],
+                        r.get("violation_id"),
+                        r.get("rule_id"),
+                        r["action"],
+                        r.get("duration_seconds") or 0,
+                        r.get("reason"),
+                        r.get("new_nick"),
+                        r.get("moderator_id") or 0,
+                        r.get("moderator_name"),
+                        r.get("moderator_display_name"),
+                        r.get("status") or "pending",
+                        r.get("result_message"),
+                        r.get("created_at"),
+                        r.get("executed_at"),
+                    ),
+                )
+
             bridge_conn.commit()
 
             # --- ШАГ 3: Обновляем снимок состояния ---
@@ -917,13 +1050,24 @@ class PulseBridge:
             snap.violation_ids = {int(r["id"]) for r in m_viols}
             snap.punishment_ids = {int(r["id"]) for r in m_puns}
             snap.punishments_by_vid = {}
+            snap.manual_punishment_sigs = set()
             for r in m_puns:
-                if r["violation_id"] is not None:
+                if r.get("violation_id") is not None and int(r["violation_id"]) > 0:
                     snap.punishments_by_vid[int(r["violation_id"])] = (
-                        str(r["action"] or ""),
-                        int(r["duration_seconds"] or 0),
-                        str(r["status"] or "applied"),
+                        str(r.get("action") or ""),
+                        int(r.get("duration_seconds") or 0),
+                        str(r.get("status") or "applied"),
                     )
+                else:
+                    snap.manual_punishment_sigs.add((
+                        int(r.get("guild_id") or 0),
+                        int(r.get("user_id") or 0),
+                        str(r.get("action") or ""),
+                        int(r.get("duration_seconds") or 0),
+                        str(r.get("reason") or ""),
+                        str(r.get("created_at") or ""),
+                    ))
+            snap.web_action_ids = {int(r["id"]) for r in m_actions}
             snap.banwords = {(int(r["guild_id"]), str(r["word"])) for r in m_words}
             snap.exceptions = {
                 (int(r["guild_id"]), int(r["channel_id"]), str(r["rule"])) for r in m_ex
@@ -988,104 +1132,552 @@ class PulseBridge:
             pass
 
     # ------------------------------------------------------------------
-    # Выполнение в Discord вердиктов из веб-панели Pulse (moderator_id = 0)
+    # Выполнение в Discord вердиктов и наказаний из веб-панели Pulse
     # ------------------------------------------------------------------
     def _init_processed_punishments(self) -> None:
         db = get_db()
         with db._session() as conn:
             rows = conn.execute(
-                "SELECT id FROM punishments WHERE moderator_id = 0 OR moderator_id IS NULL"
+                """SELECT id FROM punishments
+                   WHERE (moderator_id = 0 OR moderator_id IS NULL)
+                     AND COALESCE(status, '') != 'pending'"""
             ).fetchall()
             for r in rows:
                 self._processed_web_punishments.add(int(r["id"]))
 
     async def execute_pending_web_decisions(self) -> None:
-        """Находит новые решения из веб-панели Pulse (moderator_id = 0) и реально применяет их в Discord."""
+        """Находит новые решения и прямые наказания из веб-панели Pulse
+        (как из очереди `web_actions`, так и из таблицы `punishments`)
+        и реально применяет их в Discord с обновлением карточек в #mod-log и отправкой ЛС."""
         db = get_db()
+
+        # 1. Сначала обрабатываем очередь команд `web_actions` (status = 'pending')
+        for wa in db.list_pending_web_actions():
+            wa_id = int(wa["id"])
+            gid = int(wa.get("guild_id") or 0)
+            uid = int(wa.get("user_id") or 0)
+            vid = int(wa.get("violation_id") or 0)
+            rule_id = str(wa.get("rule_id") or "").strip()
+            raw_act = str(wa.get("action") or "").lower().strip()
+            dur_sec = int(wa.get("duration_seconds") or 0)
+            reason = str(wa.get("reason") or "").strip()
+            new_nick = str(wa.get("new_nick") or "").strip()
+            mod_name = str(wa.get("moderator_name") or "pulse_web")
+            mod_disp = str(wa.get("moderator_display_name") or "Веб-панель Pulse")
+
+            if raw_act in ("reset_user", "clear_strikes"):
+                if gid and uid:
+                    db.reset_user_stats(gid, uid)
+                    await self._apply_discord_punishment(
+                        guild_id=gid,
+                        user_id=uid,
+                        action="reset_user",
+                        duration_sec=0,
+                        violation_id=0,
+                        rule_id="",
+                        reason=reason or "Сброс страйков через веб-панель Pulse",
+                        moderator_display=mod_disp,
+                    )
+                    db.mark_web_action_status(wa_id, "applied", "Страйки и наказания пользователя сброшены")
+                else:
+                    db.mark_web_action_status(wa_id, "failed", "Не указан guild_id или user_id")
+                continue
+
+            # Если наказание выдано напрямую пользователю без violation_id — создаём запись в violations для истории и страйков
+            if not vid and raw_act in ("warn", "timeout", "mute", "kick", "ban") and gid and uid:
+                vid = db.add_violation(
+                    gid,
+                    uid,
+                    rule_id=rule_id or "manual",
+                    severity="high" if raw_act == "ban" else "medium",
+                    method="pulse_web",
+                    reason=reason or f"Наказание ({raw_act}) выдано через веб-панель Pulse",
+                    message_snapshot=reason or f"Выдано вручную из веб-панели Pulse ({mod_disp})",
+                    original_text=reason or f"Выдано вручную из веб-панели Pulse ({mod_disp})",
+                )
+
+            norm_act = {"mute": "timeout", "unmute": "untimeout", "reset_nick": "nick"}.get(raw_act, raw_act)
+            pid = 0
+            if gid and (uid or vid):
+                if vid:
+                    with db._session() as conn:
+                        conn.execute("DELETE FROM punishments WHERE violation_id = ?", (vid,))
+                        conn.commit()
+                pid = db.add_punishment(
+                    gid,
+                    uid,
+                    violation_id=vid or None,
+                    moderator_id=0,
+                    moderator_name=mod_name,
+                    moderator_display_name=mod_disp,
+                    action=norm_act,
+                    duration_seconds=dur_sec,
+                    reason=reason or new_nick or None,
+                    status="dismissed" if norm_act == "dismiss" else "applied",
+                )
+                self._processed_web_punishments.add(pid)
+
+            ok, msg = await self._apply_discord_punishment(
+                guild_id=gid,
+                user_id=uid,
+                action=norm_act,
+                duration_sec=dur_sec,
+                violation_id=vid,
+                rule_id=rule_id,
+                reason=reason,
+                new_nick=new_nick,
+                moderator_display=mod_disp,
+                punishment_id=pid,
+            )
+            db.mark_web_action_status(wa_id, "applied" if ok else "failed", msg)
+
+        # 2. Обрабатываем новые записи из таблицы `punishments` (добавленные напрямую или через actionDecide)
         with db._session() as conn:
             rows = conn.execute(
                 """SELECT p.id AS pid, p.guild_id, p.user_id, p.violation_id, p.action,
-                          p.duration_seconds, p.status,
-                          v.channel_id, v.message_id, v.original_text, v.rule_id
+                          p.duration_seconds, p.reason AS p_reason, p.status,
+                          p.moderator_name, p.moderator_display_name,
+                          v.channel_id, v.message_id, v.original_text, v.rule_id,
+                          v.reason AS v_reason, v.panel_channel_id, v.panel_message_id
                    FROM punishments p
                    LEFT JOIN violations v ON v.id = p.violation_id
-                   WHERE (p.moderator_id = 0 OR p.moderator_id IS NULL)
+                   WHERE (p.moderator_id = 0 OR p.moderator_id IS NULL OR p.status = 'pending')
                    ORDER BY p.id ASC"""
             ).fetchall()
 
         for r in rows:
-            pid = int(r["pid"])
+            r_d = dict(r)
+            pid = int(r_d["pid"])
             if pid in self._processed_web_punishments:
                 continue
             self._processed_web_punishments.add(pid)
 
-            action = str(r["action"] or "").lower()
-            guild_id = int(r["guild_id"] or 0)
-            user_id = int(r["user_id"] or 0)
-            vid = int(r["violation_id"] or 0)
-            duration_sec = int(r["duration_seconds"] or 0)
-            channel_id = int(r["channel_id"] or 0)
-            message_id = int(r["message_id"] or 0)
-            orig_text = r["original_text"] or ""
-            rule_id = r["rule_id"] or ""
+            raw_act = str(r_d.get("action") or "").lower().strip()
+            norm_act = {"mute": "timeout", "unmute": "untimeout", "reset_nick": "nick"}.get(raw_act, raw_act)
+            guild_id = int(r_d.get("guild_id") or 0)
+            user_id = int(r_d.get("user_id") or 0)
+            vid = int(r_d.get("violation_id") or 0)
+            duration_sec = int(r_d.get("duration_seconds") or 0)
+            rule_id = str(r_d.get("rule_id") or "")
+            reason = str(r_d.get("p_reason") or r_d.get("v_reason") or "").strip()
+            mod_disp = str(r_d.get("moderator_display_name") or "Веб-панель Pulse")
 
-            if action == "dismiss":
+            # Если модератор вставил ручное наказание в `punishments` без violation_id — создаём связанный кейс в violations
+            if not vid and norm_act in ("warn", "timeout", "kick", "ban") and guild_id and user_id:
+                vid = db.add_violation(
+                    guild_id,
+                    user_id,
+                    rule_id=rule_id or "manual",
+                    severity="high" if norm_act == "ban" else "medium",
+                    method="pulse_web",
+                    reason=reason or f"Наказание ({norm_act}) выдано через веб-панель Pulse",
+                    message_snapshot=reason or f"Выдано вручную из веб-панели Pulse ({mod_disp})",
+                    original_text=reason or f"Выдано вручную из веб-панели Pulse ({mod_disp})",
+                )
+                with db._session() as conn:
+                    conn.execute("UPDATE punishments SET violation_id = ? WHERE id = ?", (vid, pid))
+                    conn.commit()
+
+            ok, _ = await self._apply_discord_punishment(
+                guild_id=guild_id,
+                user_id=user_id,
+                action=norm_act,
+                duration_sec=duration_sec,
+                violation_id=vid,
+                rule_id=rule_id,
+                reason=reason,
+                moderator_display=mod_disp,
+                punishment_id=pid,
+            )
+            if str(r_d.get("status") or "") == "pending":
+                final_st = "dismissed" if norm_act == "dismiss" else ("applied" if ok else "failed")
+                db.mark_punishment_status(pid, final_st)
+
+    async def _apply_discord_punishment(
+        self,
+        guild_id: int,
+        user_id: int,
+        action: str,
+        duration_sec: int = 0,
+        violation_id: int = 0,
+        rule_id: str = "",
+        reason: str = "",
+        new_nick: str = "",
+        moderator_display: str = "Веб-панель Pulse",
+        punishment_id: int = 0,
+    ) -> tuple[bool, str]:
+        """Непосредственно выполняет действие модерации в Discord, отправляет уведомление
+        нарушителю в ЛС и обновляет/публикует эмбед в канале модерации."""
+        db = get_db()
+        v = db.get_violation(violation_id) if violation_id else None
+        if v:
+            guild_id = guild_id or int(v.get("guild_id") or 0)
+            user_id = user_id or int(v.get("user_id") or 0)
+            rule_id = rule_id or str(v.get("rule_id") or "")
+            reason = reason or str(v.get("reason") or "")
+
+        orig_text = str(v.get("original_text") or "") if v else ""
+        channel_id = int(v.get("channel_id") or 0) if v else 0
+        message_id = int(v.get("message_id") or 0) if v else 0
+
+        from bot.rules import fmt_duration
+
+        # 1. Снятие нарушения («Не нарушение») и пропуск («Пропустить»)
+        if action == "dismiss":
+            try:
+                from bot.moderation import mark_phrase_dismissed
+                if orig_text:
+                    mark_phrase_dismissed(orig_text, rule_id)
+                log.info("[PULSE] Нарушение #%d снято через веб-панель Pulse (фраза добавлена в исключения ИИ).", violation_id)
+            except Exception as e:
+                log.debug("[PULSE] Ошибка mark_phrase_dismissed: %s", e)
+            await self._update_or_post_mod_panel(
+                guild_id, user_id, violation_id, "Не нарушение (панель снята)", "", moderator_display, reason
+            )
+            self._log_web_telemetry(guild_id, user_id, violation_id, action, 0, "dismissed", moderator_display, v)
+            return True, "Нарушение снято (добавлено в исключения ИИ)"
+
+        if action == "skip":
+            log.info("[PULSE] Нарушение #%d пропущено через веб-панель Pulse.", violation_id)
+            await self._update_or_post_mod_panel(
+                guild_id, user_id, violation_id, "Пропущено (без наказания)", "", moderator_display, reason
+            )
+            self._log_web_telemetry(guild_id, user_id, violation_id, action, 0, "applied", moderator_display, v)
+            return True, "Нарушение пропущено без страйка"
+
+        if getattr(self, "bot", None) is None:
+            return True, "Записано в БД"
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return False, f"Сервер Discord {guild_id} не найден в кэше бота"
+
+        # 2. Удаляем исходное сообщение-нарушение при delete / timeout / kick / ban
+        msg_deleted = False
+        if action in ("delete", "timeout", "kick", "ban") and channel_id and message_id:
+            ch = guild.get_channel(channel_id)
+            if ch is not None:
                 try:
-                    from bot.moderation import mark_phrase_dismissed
-                    if orig_text:
-                        mark_phrase_dismissed(orig_text, rule_id)
-                    log.info("[PULSE] Нарушение #%d снято через веб-панель Pulse (фраза добавлена в исключения ИИ).", vid)
-                except Exception as e:
-                    log.debug("[PULSE] Ошибка mark_phrase_dismissed: %s", e)
-                continue
+                    await ch.get_partial_message(message_id).delete()
+                    msg_deleted = True
+                except discord.HTTPException:
+                    pass
 
-            if action == "skip":
-                log.info("[PULSE] Нарушение #%d пропущено через веб-панель Pulse.", vid)
-                continue
+        audit_reason = f"Pulse Web Panel ({moderator_display})"
+        if violation_id:
+            audit_reason += f" · Нарушение #{violation_id}"
+        if rule_id:
+            audit_reason += f" (п. {rule_id})"
+        if reason:
+            audit_reason += f": {reason[:180]}"
 
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
+        member = guild.get_member(user_id) if user_id else None
+        if member is None and user_id and action in ("warn", "timeout", "untimeout", "kick", "nick", "reset_user"):
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.HTTPException:
+                member = None
 
-            # Удаляем исходное сообщение-нарушение при delete / timeout / ban
-            if action in ("delete", "timeout", "ban") and channel_id and message_id:
-                ch = guild.get_channel(channel_id)
-                if ch is not None:
-                    try:
-                        await ch.get_partial_message(message_id).delete()
-                    except discord.HTTPException:
-                        pass
+        if member is not None:
+            try:
+                db.record_discord_member(guild_id, member)
+            except Exception:
+                pass
 
-            if action == "delete":
-                log.info("[PULSE] Сообщение нарушения #%d удалено по команде из веб-панели Pulse.", vid)
-            elif action == "timeout" and user_id:
-                dur = duration_sec if duration_sec > 0 else 3600
-                dur = min(dur, 28 * 86400)
-                member = guild.get_member(user_id)
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(user_id)
-                    except discord.HTTPException:
-                        member = None
-                if member is not None:
-                    try:
-                        await member.timeout(
-                            timedelta(seconds=dur),
-                            reason=f"Pulse Web Panel: Нарушение #{vid} (п. {rule_id})",
-                        )
-                        log.info("[PULSE] Тайм-аут (%d сек) выдан пользователю %d из веб-панели Pulse.", dur, user_id)
-                    except discord.HTTPException as e:
-                        log.warning("[PULSE] Не удалось выдать тайм-аут пользователю %d: %s", user_id, e)
-            elif action == "ban" and user_id:
+        action_title = action
+        detail_str = ""
+        ok = True
+        result_msg = "Выполнено"
+
+        if action == "delete":
+            action_title = "Удаление сообщения"
+            result_msg = "Сообщение удалено" if msg_deleted else "Запись об удалении сохранена"
+            log.info("[PULSE] Сообщение нарушения #%d удалено по команде из веб-панели Pulse.", violation_id)
+
+        elif action == "warn":
+            action_title = "Предупреждение (Варн)"
+            await self._notify_user_dm(guild, member, user_id, action_title, "", rule_id, reason)
+            result_msg = "Предупреждение выдано"
+            log.info("[PULSE] Предупреждение выдано пользователю %d из веб-панели Pulse.", user_id)
+
+        elif action == "timeout" and user_id:
+            dur = duration_sec if duration_sec > 0 else 3600
+            dur = min(dur, 28 * 86400)
+            detail_str = fmt_duration(dur)
+            action_title = "Тайм-аут (Мут)"
+            if member is None:
+                ok = False
+                result_msg = "Участник не найден на сервере"
+            else:
                 try:
-                    await guild.ban(
-                        discord.Object(id=user_id),
-                        reason=f"Pulse Web Panel: Нарушение #{vid} (п. {rule_id})",
-                        delete_message_days=1,
-                    )
-                    log.info("[PULSE] Пользователь %d забанен по команде из веб-панели Pulse (#%d).", user_id, vid)
+                    await member.timeout(timedelta(seconds=dur), reason=audit_reason)
+                    await self._notify_user_dm(guild, member, user_id, action_title, detail_str, rule_id, reason)
+                    result_msg = f"Тайм-аут ({detail_str}) выдан"
+                    log.info("[PULSE] Тайм-аут (%d сек) выдан пользователю %d из веб-панели Pulse.", dur, user_id)
                 except discord.HTTPException as e:
-                    log.warning("[PULSE] Не удалось забанить пользователя %d: %s", user_id, e)
+                    ok = False
+                    result_msg = f"Ошибка Discord API при выдаче тайм-аута: {e}"
+                    log.warning("[PULSE] Не удалось выдать тайм-аут пользователю %d: %s", user_id, e)
+
+        elif action == "untimeout" and user_id:
+            action_title = "Снятие тайм-аута (Размут)"
+            if member is None:
+                ok = False
+                result_msg = "Участник не найден на сервере"
+            else:
+                try:
+                    await member.timeout(None, reason=audit_reason)
+                    result_msg = "Тайм-аут снят"
+                    log.info("[PULSE] Тайм-аут снят с пользователя %d из веб-панели Pulse.", user_id)
+                except discord.HTTPException as e:
+                    ok = False
+                    result_msg = f"Ошибка Discord API: {e}"
+
+        elif action == "kick" and user_id:
+            action_title = "Кик с сервера"
+            if member is None:
+                ok = False
+                result_msg = "Участник не найден на сервере"
+            else:
+                await self._notify_user_dm(guild, member, user_id, action_title, "", rule_id, reason)
+                try:
+                    await member.kick(reason=audit_reason)
+                    result_msg = "Участник кикнут с сервера"
+                    log.info("[PULSE] Пользователь %d кикнут из веб-панели Pulse.", user_id)
+                except discord.HTTPException as e:
+                    ok = False
+                    result_msg = f"Ошибка Discord API при кике: {e}"
+                    log.warning("[PULSE] Не удалось кикнуть пользователя %d: %s", user_id, e)
+
+        elif action == "ban" and user_id:
+            action_title = "Бан"
+            detail_str = fmt_duration(duration_sec) if duration_sec > 0 else "перманентно"
+            await self._notify_user_dm(guild, member, user_id, action_title, detail_str, rule_id, reason)
+            try:
+                await guild.ban(
+                    discord.Object(id=user_id),
+                    reason=audit_reason,
+                    delete_message_days=1,
+                )
+                result_msg = f"Бан ({detail_str}) применён"
+                log.info("[PULSE] Пользователь %d забанен (%s) по команде из веб-панели Pulse (#%d).", user_id, detail_str, violation_id)
+            except discord.HTTPException as e:
+                ok = False
+                result_msg = f"Ошибка Discord API при бане: {e}"
+                log.warning("[PULSE] Не удалось забанить пользователя %d: %s", user_id, e)
+
+        elif action == "unban" and user_id:
+            action_title = "Разбан"
+            try:
+                await guild.unban(discord.Object(id=user_id), reason=audit_reason)
+                with db._session() as conn:
+                    conn.execute(
+                        "UPDATE punishments SET status = 'unbanned' WHERE guild_id = ? AND user_id = ? AND action = 'ban' AND status = 'applied'",
+                        (guild_id, user_id),
+                    )
+                    conn.commit()
+                result_msg = "Пользователь разбанен"
+                log.info("[PULSE] Пользователь %d разбанен по команде из веб-панели Pulse.", user_id)
+            except discord.HTTPException as e:
+                ok = False
+                result_msg = f"Ошибка Discord API при разбане: {e}"
+
+        elif action == "nick" and user_id:
+            target_nick = (new_nick or reason or f"Участник #{str(user_id)[-4:]}").strip()[:32]
+            action_title = "Смена никнейма"
+            detail_str = f"«{target_nick}»"
+            if member is None:
+                ok = False
+                result_msg = "Участник не найден на сервере"
+            else:
+                try:
+                    await member.edit(nick=target_nick, reason=audit_reason)
+                    db.record_discord_member(guild_id, member)
+                    result_msg = f"Никнейм изменён на {detail_str}"
+                except discord.HTTPException as e:
+                    ok = False
+                    result_msg = f"Ошибка смены никнейма: {e}"
+
+        elif action == "reset_user" and user_id:
+            action_title = "Сброс страйков и наказаний"
+            if member is not None and getattr(member, "is_timed_out", lambda: False)():
+                try:
+                    await member.timeout(None, reason=audit_reason)
+                except discord.HTTPException:
+                    pass
+            result_msg = "Все страйки сброшены"
+
+        if ok:
+            await self._update_or_post_mod_panel(
+                guild_id, user_id, violation_id, action_title, detail_str, moderator_display, reason
+            )
+            self._log_web_telemetry(
+                guild_id, user_id, violation_id, action, duration_sec, "applied", moderator_display, v
+            )
+        return ok, result_msg
+
+    async def _notify_user_dm(
+        self,
+        guild: discord.Guild,
+        member: Optional[discord.Member],
+        user_id: int,
+        action_title: str,
+        duration_label: str,
+        rule_id: str,
+        reason: str,
+    ) -> None:
+        """Отправляет участнику уведомление в ЛС о вынесенном из веб-панели наказании."""
+        target = member
+        if target is None and getattr(self, "bot", None) is not None and user_id:
+            try:
+                target = await self.bot.fetch_user(user_id)
+            except Exception:
+                target = None
+        if target is None:
+            return
+        try:
+            from bot.rules import RULES
+            rule_title = RULES.get(rule_id, {}).get("title", "") if rule_id else ""
+            embed = discord.Embed(
+                title=f"⚖ Модерация сервера «{guild.name}»",
+                color=discord.Color(0xE53E3E if "Бан" in action_title else 0x7F5AF0),
+            )
+            act_val = f"**{action_title}**" + (f" ({duration_label})" if duration_label else "")
+            embed.add_field(name="Наказание", value=act_val, inline=True)
+            if rule_id:
+                r_str = f"**{rule_id}**" + (f" — {rule_title}" if rule_title else "")
+                embed.add_field(name="Пункт правил", value=r_str, inline=True)
+            if reason:
+                embed.add_field(name="Причина", value=reason[:900], inline=False)
+            embed.set_footer(text=f"Вынесено через веб-панель Pulse · {guild.name}")
+            await target.send(embed=embed)
+        except Exception:
+            pass
+
+    async def _update_or_post_mod_panel(
+        self,
+        guild_id: int,
+        user_id: int,
+        violation_id: int,
+        action_title: str,
+        detail_str: str,
+        moderator_display: str,
+        reason: str = "",
+    ) -> None:
+        """Обновляет существующую панель нарушения в #mod-log (перекрашивает в зелёный и отключает кнопки)
+        либо отправляет новый отчётный эмбед, если наказание было выдано напрямую из веб-панели."""
+        if getattr(self, "bot", None) is None:
+            return
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+
+        db = get_db()
+        v = db.get_violation(violation_id) if violation_id else None
+        panel_ch_id = int(v.get("panel_channel_id") or 0) if v else 0
+        panel_msg_id = int(v.get("panel_message_id") or 0) if v else 0
+
+        from bot.client import RECENT_PANELS, BRAND_GREEN, _resolve_mod_channel
+        from bot.views.mod_buttons import ModActionView
+
+        if (not panel_ch_id or not panel_msg_id) and user_id:
+            info = RECENT_PANELS.get((guild_id, user_id))
+            if info and (not violation_id or info[2] == violation_id):
+                panel_ch_id, panel_msg_id = info[0], info[1]
+
+        stamp = time.strftime("%d.%m %H:%M")
+        val_text = f"**{action_title}**" + (f" ({detail_str})" if detail_str else "")
+        if reason:
+            val_text += f"\nПричина: *{reason[:200]}*"
+        val_text += f"\nМодератор: 🌐 **{moderator_display}** · {stamp}"
+
+        # Если есть сообщение карточки нарушения в Discord — редактируем его и отключаем кнопки
+        if panel_ch_id and panel_msg_id:
+            ch = guild.get_channel(panel_ch_id)
+            if ch is not None:
+                try:
+                    panel_msg = await ch.fetch_message(panel_msg_id)
+                    if panel_msg.embeds:
+                        embed = discord.Embed.from_dict(panel_msg.embeds[0].to_dict())
+                        embed.add_field(
+                            name="⚖ Наказание вынесено",
+                            value=val_text,
+                            inline=False,
+                        )
+                        embed.color = discord.Color(BRAND_GREEN)
+                        view = ModActionView(
+                            guild_id,
+                            user_id,
+                            violation_id,
+                            target_msg_id=v.get("message_id") if v else None,
+                            channel_id=v.get("channel_id") if v else None,
+                        )
+                        for child in view.children:
+                            if isinstance(child, discord.ui.Button):
+                                child.disabled = True
+                        await panel_msg.edit(embed=embed, view=view)
+                        return
+                except Exception:
+                    pass
+
+        # Если карточки не было (ручное наказание из веб-панели) — отправляем лог в канал модерации
+        server = db.get_server(guild_id)
+        mod_ch = _resolve_mod_channel(guild, server.get("mod_channel_id"))
+        if mod_ch is None:
+            return
+        try:
+            u_prof = db.get_user_profile(guild_id, user_id) if user_id else None
+            u_label = f"<@{user_id}> (`{user_id}`)" if user_id else "—"
+            if u_prof and u_prof.get("display_name"):
+                u_label = f"**{u_prof['display_name']}** (<@{user_id}>)"
+            embed = discord.Embed(
+                title=f"🌐 Наказание из веб-панели Pulse" + (f" (№{violation_id})" if violation_id else ""),
+                color=discord.Color(BRAND_GREEN),
+            )
+            if u_prof and u_prof.get("avatar_url"):
+                embed.set_thumbnail(url=u_prof["avatar_url"])
+            embed.add_field(name="Участник", value=u_label, inline=True)
+            embed.add_field(name="Решение", value=val_text, inline=False)
+            await mod_ch.send(embed=embed)
+        except Exception:
+            pass
+
+    def _log_web_telemetry(
+        self,
+        guild_id: int,
+        user_id: int,
+        violation_id: int,
+        action: str,
+        duration_sec: int,
+        status: str,
+        moderator_display: str,
+        v: Optional[dict[str, Any]],
+    ) -> None:
+        try:
+            from bot.telemetry import log_event
+            log_event(
+                "moderator_action",
+                source="pulse_web",
+                guild_id=guild_id,
+                guild_name=v.get("guild_name") if v else None,
+                user_id=user_id,
+                user_name=v.get("user_name") if v else None,
+                user_display_name=v.get("user_display_name") if v else None,
+                user_avatar_url=v.get("user_avatar_url") if v else None,
+                violation_id=violation_id,
+                moderator_id=0,
+                moderator_name="pulse_web",
+                moderator_display_name=moderator_display,
+                action=action,
+                duration_seconds=duration_sec,
+                status=status,
+                rule_id=v.get("rule_id") if v else None,
+                severity=v.get("severity") if v else None,
+                method=v.get("method") if v else "pulse_web",
+                text=v.get("original_text") if v else None,
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Синхронизация с удалённым сервером через Pterodactyl Client API
@@ -1259,8 +1851,10 @@ class PulseBridge:
         query: dict[str, str],
         body: bytes,
     ) -> dict[str, Any]:
-        if method == "POST" and path == "/api/dap/action":
+        if method == "POST" and path in ("/api/dap/action", "/api/dap/punish"):
             payload = json.loads(body.decode("utf-8", errors="ignore") or "{}")
+            if path == "/api/dap/punish" and not payload.get("type"):
+                payload["type"] = "punish"
             res = await asyncio.to_thread(self._handle_api_action, payload)
             await self.execute_pending_web_decisions()
             return res
@@ -1362,37 +1956,106 @@ class PulseBridge:
                         (gid,),
                     ).fetchall()
                 ]
+                out["users"] = [
+                    {
+                        "userId": str(r["user_id"]),
+                        "username": r["username"] or "",
+                        "globalName": r["global_name"] or "",
+                        "displayName": r["display_name"] or r["username"] or str(r["user_id"]),
+                        "avatarUrl": r["avatar_url"] or "",
+                        "topRoleName": r["top_role_name"] or "",
+                        "topRoleColor": r["top_role_color"] or "",
+                        "isModerator": bool(r["is_moderator"]),
+                        "strikes": db.count_real_violations(gid, int(r["user_id"])),
+                    }
+                    for r in conn.execute(
+                        "SELECT * FROM users WHERE guild_id = ? ORDER BY updated_at DESC LIMIT 300",
+                        (gid,),
+                    ).fetchall()
+                ]
         return out
 
     def _handle_api_action(self, body: dict[str, Any]) -> dict[str, Any]:
-        act_type = str(body.get("type") or "").strip()
+        from bot.views.mod_buttons import parse_duration
+
+        act_type = str(body.get("type") or "").strip().lower()
+        action = str(body.get("action") or "").strip().lower()
+        if not act_type and action:
+            act_type = "decide" if body.get("violationId") else "punish"
+        elif act_type in (
+            "warn", "delete", "timeout", "mute", "untimeout", "unmute",
+            "kick", "ban", "unban", "nick", "reset_nick", "dismiss", "skip",
+        ):
+            action = act_type
+            act_type = "decide" if body.get("violationId") else "punish"
+
+        dur = int(body.get("durationSeconds") or 0)
+        if not dur and body.get("duration"):
+            default_unit = "d" if action == "ban" else "m"
+            dur = parse_duration(str(body.get("duration")), default_unit=default_unit)
+
+        reason = str(body.get("reason") or "").strip()
+        new_nick = str(body.get("newNick") or body.get("nick") or "").strip()
+        rule_id = str(body.get("ruleId") or body.get("rule") or "").strip()
+        mod_name = str(body.get("moderatorName") or body.get("moderator") or "Веб-панель Pulse").strip()
+
         db = get_db()
         if act_type == "decide":
             vid = int(body.get("violationId") or 0)
-            action = str(body.get("action") or "dismiss").lower()
-            dur = int(body.get("durationSeconds") or 0)
             v = db.get_violation(vid)
             if not v:
                 return {"ok": False, "error": f"Нарушение #{vid} не найдено"}
-            with db._session() as conn:
-                conn.execute("DELETE FROM punishments WHERE violation_id = ?", (vid,))
-                conn.commit()
-            db.add_punishment(
-                v["guild_id"],
-                v["user_id"],
+            action_id = db.enqueue_web_action(
+                guild_id=int(v["guild_id"]),
+                user_id=int(v["user_id"]),
                 violation_id=vid,
-                moderator_id=0,
-                action=action,
+                rule_id=rule_id or v.get("rule_id"),
+                action=action or "dismiss",
                 duration_seconds=dur,
-                status="dismissed" if action == "dismiss" else "applied",
+                reason=reason,
+                new_nick=new_nick,
+                moderator_display_name=mod_name,
             )
-            return {"ok": True}
-        if act_type == "reset_user":
+            return {"ok": True, "actionId": action_id, "violationId": vid}
+
+        if act_type in ("punish", "mod_action"):
+            gid = int(body.get("guildId") or 0)
+            uid = int(body.get("userId") or 0)
+            vid = int(body.get("violationId") or 0)
+            if vid and (not gid or not uid):
+                v = db.get_violation(vid)
+                if v:
+                    gid = gid or int(v["guild_id"])
+                    uid = uid or int(v["user_id"])
+            if not gid or not uid:
+                return {"ok": False, "error": "Укажите guildId и userId"}
+            action_id = db.enqueue_web_action(
+                guild_id=gid,
+                user_id=uid,
+                violation_id=vid or None,
+                rule_id=rule_id or None,
+                action=action or "timeout",
+                duration_seconds=dur,
+                reason=reason or None,
+                new_nick=new_nick or None,
+                moderator_display_name=mod_name,
+            )
+            return {"ok": True, "actionId": action_id}
+
+        if act_type in ("reset_user", "clear_strikes"):
             gid = int(body.get("guildId") or 0)
             uid = int(body.get("userId") or 0)
             if gid and uid:
-                db.reset_user_stats(gid, uid)
-            return {"ok": True}
+                action_id = db.enqueue_web_action(
+                    guild_id=gid,
+                    user_id=uid,
+                    action="reset_user",
+                    reason=reason or "Сброс статистики из веб-панели",
+                    moderator_display_name=mod_name,
+                )
+                return {"ok": True, "actionId": action_id}
+            return {"ok": False, "error": "Укажите guildId и userId"}
+
         return {"ok": True}
 
     def _build_csv_export(self, guild_param: Optional[str], days: int) -> str:

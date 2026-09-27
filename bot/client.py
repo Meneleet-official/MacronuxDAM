@@ -1034,6 +1034,7 @@ async def post_violation_panel(message, server, rule_id, method, severity, reaso
 
     try:
         sent = await channel.send(content=ping_content, embed=embed, view=view)
+        db.set_violation_panel_message(violation_id, channel.id, sent.id)
         RECENT_PANELS[(guild.id, message.author.id)] = (
             channel.id, sent.id, violation_id, message.channel.id, message.id,
         )
@@ -1227,7 +1228,8 @@ async def post_profile_violation_panel(
         show_nick_btn=True,
     )
     try:
-        await channel.send(embed=embed, view=view)
+        sent = await channel.send(embed=embed, view=view)
+        db.set_violation_panel_message(violation_id, channel.id, sent.id)
     except discord.HTTPException as e:
         print(f"[PROFILE-PANEL] ошибка отправки: {e}")
 
@@ -1290,7 +1292,8 @@ async def post_raid_alert_panel(guild: discord.Guild, trigger_member: discord.Me
     raider_ids = [uid for _, uid, _ in raiders]
     view = RaidActionView(guild.id, violation_id, raider_ids)
     try:
-        await channel.send(content=ping_content, embed=embed, view=view)
+        sent = await channel.send(content=ping_content, embed=embed, view=view)
+        db.set_violation_panel_message(violation_id, channel.id, sent.id)
     except discord.HTTPException as e:
         print(f"[RAID-PANEL] ошибка отправки: {e}")
 

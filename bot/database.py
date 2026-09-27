@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS violations (
     channel_id INTEGER,
     channel_name TEXT,
     message_id INTEGER,
+    panel_channel_id INTEGER,
+    panel_message_id INTEGER,
     jump_url TEXT,
     attachments_json TEXT,
     created_at TEXT DEFAULT (datetime('now'))
@@ -106,6 +108,25 @@ CREATE TABLE IF NOT EXISTS punishments (
     reason TEXT,
     status TEXT DEFAULT 'pending',
     created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS web_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    violation_id INTEGER,
+    rule_id TEXT,
+    action TEXT NOT NULL,
+    duration_seconds INTEGER DEFAULT 0,
+    reason TEXT,
+    new_nick TEXT,
+    moderator_id INTEGER DEFAULT 0,
+    moderator_name TEXT DEFAULT 'pulse_web',
+    moderator_display_name TEXT DEFAULT 'Веб-панель Pulse',
+    status TEXT DEFAULT 'pending',
+    result_message TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    executed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS banned_words (
@@ -138,6 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_punishments_action_status ON punishments(action, 
 CREATE INDEX IF NOT EXISTS idx_users_guild_user ON users(guild_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_channels_guild ON channels(guild_id);
 CREATE INDEX IF NOT EXISTS idx_roles_guild ON roles(guild_id);
+CREATE INDEX IF NOT EXISTS idx_web_actions_status ON web_actions(status);
 """
 
 _MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
@@ -175,6 +197,8 @@ _MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
     ("violations", "user_avatar_url", "TEXT"),
     ("violations", "reason", "TEXT"),
     ("violations", "channel_name", "TEXT"),
+    ("violations", "panel_channel_id", "INTEGER"),
+    ("violations", "panel_message_id", "INTEGER"),
     ("violations", "jump_url", "TEXT"),
     ("violations", "attachments_json", "TEXT"),
     # punishments
@@ -219,6 +243,8 @@ _VIOLATION_COLS = {
     "channel_id",
     "channel_name",
     "message_id",
+    "panel_channel_id",
+    "panel_message_id",
     "jump_url",
     "attachments_json",
 }
@@ -692,6 +718,18 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    def set_violation_panel_message(
+        self, violation_id: int, panel_channel_id: int, panel_message_id: int
+    ) -> None:
+        """Сохраняет ID сообщения карточки модерации в Discord, чтобы при вынесении
+        решения из веб-панели Pulse бот мог автоматически обновить эмбед и погасить кнопки."""
+        with self._session() as conn:
+            conn.execute(
+                "UPDATE violations SET panel_channel_id = ?, panel_message_id = ? WHERE id = ?",
+                (panel_channel_id, panel_message_id, violation_id),
+            )
+            conn.commit()
+
     def count_violations(self, guild_id: int, user_id: int) -> int:
         with self._session() as conn:
             row = conn.execute(
@@ -842,6 +880,65 @@ class Database:
             conn.execute(
                 "UPDATE punishments SET status = ? WHERE id = ?",
                 (status, punishment_id),
+            )
+            conn.commit()
+
+    # ---- Web Actions (очередь команд и наказаний из веб-панели Pulse) ----
+    def enqueue_web_action(
+        self,
+        guild_id: int,
+        user_id: int,
+        action: str,
+        duration_seconds: int = 0,
+        violation_id: Optional[int] = None,
+        rule_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        new_nick: Optional[str] = None,
+        moderator_id: int = 0,
+        moderator_name: str = "pulse_web",
+        moderator_display_name: str = "Веб-панель Pulse",
+    ) -> int:
+        with self._session() as conn:
+            cur = conn.execute(
+                """INSERT INTO web_actions (
+                       guild_id, user_id, violation_id, rule_id, action,
+                       duration_seconds, reason, new_nick,
+                       moderator_id, moderator_name, moderator_display_name, status
+                   )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                (
+                    guild_id,
+                    user_id,
+                    violation_id,
+                    rule_id,
+                    action.lower().strip(),
+                    int(duration_seconds or 0),
+                    reason,
+                    new_nick,
+                    int(moderator_id or 0),
+                    moderator_name or "pulse_web",
+                    moderator_display_name or "Веб-панель Pulse",
+                ),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def list_pending_web_actions(self) -> list[dict[str, Any]]:
+        with self._session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM web_actions WHERE status = 'pending' ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_web_action_status(
+        self, action_id: int, status: str, result_message: Optional[str] = None
+    ) -> None:
+        with self._session() as conn:
+            conn.execute(
+                """UPDATE web_actions
+                   SET status = ?, result_message = ?, executed_at = datetime('now')
+                   WHERE id = ?""",
+                (status, result_message, action_id),
             )
             conn.commit()
 

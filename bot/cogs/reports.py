@@ -233,7 +233,8 @@ class ReportsCog(commands.Cog):
         )
 
         try:
-            await mod_channel.send(embed=embed, view=view)
+            sent = await mod_channel.send(embed=embed, view=view)
+            db.set_violation_panel_message(violation_id, mod_channel.id, sent.id)
             await interaction.response.send_message(
                 f"✅ Ваша жалоба **№{violation_id}** отправлена модераторам.",
                 ephemeral=True,
