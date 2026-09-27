@@ -141,10 +141,16 @@ class ModBot(commands.Bot):
                 await self.tree.sync(guild=guild)
             except discord.HTTPException as e:
                 print(f"[SYNC] guild {guild.id}: {e}")
-        # Фоновые задачи: сброс прогресса сканирования, авто-разбан, авто-дайджест и воркеры очереди.
+        # Фоновые задачи: сброс прогресса сканирования, авто-разбан, авто-дайджест, мост Pulse/Pterodactyl и воркеры очереди.
         self._bg_tasks.append(self.loop.create_task(self._scan_flush_loop()))
         self._bg_tasks.append(self.loop.create_task(self._unban_loop()))
         self._bg_tasks.append(self.loop.create_task(self._weekly_digest_loop()))
+        try:
+            from bot.pulse_bridge import PulseBridge
+            self.pulse_bridge = PulseBridge(self)
+            self._bg_tasks.append(self.loop.create_task(self.pulse_bridge.sync_loop()))
+        except Exception as e:
+            print(f"[PULSE] ошибка запуска моста: {e}")
         for i in range(MODERATION_WORKERS):
             self._bg_tasks.append(self.loop.create_task(self._moderation_worker(i)))
 
@@ -290,6 +296,11 @@ class ModBot(commands.Bot):
         for task in self._bg_tasks:
             task.cancel()
         self._bg_tasks.clear()
+        if getattr(self, "pulse_bridge", None) is not None:
+            try:
+                await self.pulse_bridge.stop()
+            except Exception as e:
+                print(f"[PULSE] close error: {e}")
         try:
             flush_scan_progress()
         except Exception as e:

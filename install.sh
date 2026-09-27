@@ -143,16 +143,23 @@ if [[ -z "${CURRENT_TOKEN}" || "${CURRENT_TOKEN}" == "YOUR_DISCORD_BOT_TOKEN_HER
 fi
 
 # 4. Настройка прав на скрипт управления botctl.sh и глобальной команды `pmx`
-chmod +x "${APP_DIR}/botctl.sh" "${APP_DIR}/install.sh"
-${SUDO} ln -sf "${APP_DIR}/botctl.sh" "${CLI_LINK}"
-ok "Утилита управления установлена: теперь доступна команда ${BOLD}pmx${NC} из любой папки."
+chmod +x "${APP_DIR}/botctl.sh" "${APP_DIR}/install.sh" "${APP_DIR}/main.py"
+if [[ -w "/usr/local/bin" ]] || [[ -n "${SUDO}" ]] || [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    ${SUDO} ln -sf "${APP_DIR}/botctl.sh" "${CLI_LINK}" 2>/dev/null || true
+    ok "Утилита управления установлена: теперь доступна команда ${BOLD}pmx${NC} из любой папки."
+fi
 
-# 5. Создание и регистрация systemd-сервиса
-RUN_USER="${SUDO_USER:-$(whoami)}"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# 5. Инициализация БД modbot.db и авто-интеграция с контейнерами Pterodactyl (плагин Pulse)
+info "Инициализация базы данных и поиск серверов Pterodactyl (плагин Pulse)..."
+"${APP_DIR}/.venv/bin/python" "${APP_DIR}/main.py" --pulse-sync || true
 
-info "Создание systemd-сервиса ${SERVICE_FILE} (пользователь: ${RUN_USER})..."
-${SUDO} tee "${SERVICE_FILE}" >/dev/null <<EOF
+# 6. Создание и регистрация systemd-сервиса (если на сервере доступен systemd)
+if command -v systemctl >/dev/null 2>&1 && [[ -d "/run/systemd/system" ]]; then
+    RUN_USER="${SUDO_USER:-$(whoami)}"
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+    info "Создание systemd-сервиса ${SERVICE_FILE} (пользователь: ${RUN_USER})..."
+    ${SUDO} tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=Macronux (PMX) Discord Moderation Bot
 After=network-online.target
@@ -178,20 +185,15 @@ SyslogIdentifier=${SERVICE_NAME}
 WantedBy=multi-user.target
 EOF
 
-${SUDO} systemctl daemon-reload
-${SUDO} systemctl enable "${SERVICE_NAME}" >/dev/null
+    ${SUDO} systemctl daemon-reload
+    ${SUDO} systemctl enable "${SERVICE_NAME}" >/dev/null
+fi
 
 # Проверяем, задан ли BOT_TOKEN перед автозапуском
 FINAL_TOKEN="$(grep -E '^BOT_TOKEN=' "${ENV_FILE}" | cut -d'=' -f2- | tr -d '[:space:]' || true)"
 if [[ -n "${FINAL_TOKEN}" && "${FINAL_TOKEN}" != "YOUR_DISCORD_BOT_TOKEN_HERE" ]]; then
-    info "Запуск сервиса ${SERVICE_NAME}..."
-    ${SUDO} systemctl restart "${SERVICE_NAME}"
-    sleep 2
-    if ${SUDO} systemctl is-active --quiet "${SERVICE_NAME}"; then
-        ok "Бот успешно запущен и работает в фоновом режиме (systemd)!"
-    else
-        warn "Сервис не смог стартовать. Проверьте логи командой: pmx logs"
-    fi
+    info "Запуск бота..."
+    "${APP_DIR}/botctl.sh" restart
 else
     warn "BOT_TOKEN ещё не указан в ${ENV_FILE}."
     warn "Укажите токен командой: pmx config  и затем запустите бота: pmx start"
@@ -202,9 +204,11 @@ echo -e "${GREEN}${BOLD}========================================================
 echo -e "${GREEN}${BOLD} ✅ Установка завершена! Управление ботом на VPS:${NC}"
 echo -e "   • ${BOLD}pmx${NC}          — открыть интерактивное меню управления"
 echo -e "   • ${BOLD}pmx status${NC}   — статус бота, RAM/CPU и статистика БД"
+echo -e "   • ${BOLD}pmx pulse${NC}    — автоподключение к плагину Pulse в Pterodactyl"
 echo -e "   • ${BOLD}pmx logs${NC}     — живые логи в реальном времени"
 echo -e "   • ${BOLD}pmx restart${NC}  — перезапустить бота"
 echo -e "   • ${BOLD}pmx update${NC}   — обновить код из Git + перезапустить"
 echo -e "   • ${BOLD}pmx backup${NC}   — сделать резервную копию БД и настроек"
 echo -e "   • ${BOLD}pmx config${NC}   — редактировать .env (токены и ключи)"
 echo -e "${GREEN}${BOLD}==============================================================${NC}"
+

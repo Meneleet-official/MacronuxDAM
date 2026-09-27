@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PMX (`pmx` / `botctl.sh`) — Панель и CLI-утилита управления ботом на VPS
+# PMX (`pmx` / `botctl.sh`) — Панель и CLI-утилита управления ботом на VPS / Pterodactyl
 # ==============================================================================
 set -euo pipefail
 
@@ -20,10 +20,21 @@ DB_FILE="${APP_DIR}/data/modbot.db"
 LOG_FILE="${APP_DIR}/data/modbot.log"
 TELEMETRY_FILE="${APP_DIR}/data/telemetry.jsonl"
 BACKUP_DIR="${APP_DIR}/backups"
+PID_FILE="${APP_DIR}/data/bot.pid"
+
+PYTHON_BIN="${APP_DIR}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    PYTHON_BIN="$(command -v python3 || command -v python || echo python3)"
+fi
 
 SUDO=""
 if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
+fi
+
+HAS_SYSTEMD=0
+if command -v systemctl >/dev/null 2>&1 && [[ -d "/run/systemd/system" ]] && [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
+    HAS_SYSTEMD=1
 fi
 
 # Цвета
@@ -41,7 +52,18 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 is_running() {
-    systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null
+        return $?
+    fi
+    if [[ -f "${PID_FILE}" ]]; then
+        local pid
+        pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    pgrep -f "${APP_DIR}/main.py" >/dev/null 2>&1
 }
 
 cmd_status() {
@@ -65,13 +87,24 @@ cmd_status() {
         echo -e "Файл логов:   ${LOG_FILE} (${LOG_SIZE})"
     fi
 
-    echo ""
-    ${SUDO} systemctl status "${SERVICE_NAME}" --no-pager -n 12 || true
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        echo ""
+        ${SUDO} systemctl status "${SERVICE_NAME}" --no-pager -n 12 || true
+    fi
 }
 
 cmd_start() {
-    info "Запуск сервиса ${SERVICE_NAME}..."
-    ${SUDO} systemctl start "${SERVICE_NAME}"
+    info "Инициализация БД и синхронизация моста Pulse / Pterodactyl..."
+    "${PYTHON_BIN}" "${APP_DIR}/main.py" --pulse-sync >/dev/null 2>&1 || true
+
+    info "Запуск бота (${SERVICE_NAME})..."
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        ${SUDO} systemctl start "${SERVICE_NAME}"
+    else
+        mkdir -p "${APP_DIR}/data"
+        nohup "${PYTHON_BIN}" "${APP_DIR}/main.py" >> "${APP_DIR}/bot_run2.log" 2>> "${APP_DIR}/bot_err.log" &
+        echo $! > "${PID_FILE}"
+    fi
     sleep 1
     if is_running; then
         ok "Бот успешно запущен!"
@@ -82,15 +115,35 @@ cmd_start() {
 }
 
 cmd_stop() {
-    info "Остановка сервиса ${SERVICE_NAME}..."
-    ${SUDO} systemctl stop "${SERVICE_NAME}"
+    info "Остановка бота (${SERVICE_NAME})..."
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        ${SUDO} systemctl stop "${SERVICE_NAME}"
+    else
+        if [[ -f "${PID_FILE}" ]]; then
+            local pid
+            pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+            [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
+            rm -f "${PID_FILE}"
+        fi
+        pkill -f "${APP_DIR}/main.py" 2>/dev/null || true
+    fi
     ok "Бот остановлен."
 }
 
 cmd_restart() {
-    info "Перезапуск сервиса ${SERVICE_NAME}..."
-    ${SUDO} systemctl restart "${SERVICE_NAME}"
-    sleep 1
+    info "Синхронизация моста Pulse / Pterodactyl..."
+    "${PYTHON_BIN}" "${APP_DIR}/main.py" --pulse-sync >/dev/null 2>&1 || true
+
+    info "Перезапуск бота (${SERVICE_NAME})..."
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        ${SUDO} systemctl restart "${SERVICE_NAME}"
+        sleep 1
+    else
+        cmd_stop
+        sleep 1
+        cmd_start
+        return
+    fi
     if is_running; then
         ok "Бот успешно перезапущен!"
     else
@@ -101,7 +154,13 @@ cmd_restart() {
 
 cmd_logs() {
     info "Просмотр живых логов (нажмите Ctrl+C для выхода)..."
-    ${SUDO} journalctl -u "${SERVICE_NAME}" -f -n 100
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        ${SUDO} journalctl -u "${SERVICE_NAME}" -f -n 100
+    elif [[ -f "${LOG_FILE}" ]]; then
+        tail -f -n 100 "${LOG_FILE}"
+    else
+        tail -f -n 100 "${APP_DIR}/bot_run2.log" "${APP_DIR}/bot_err.log"
+    fi
 }
 
 cmd_errors() {
@@ -109,8 +168,36 @@ cmd_errors() {
     if [[ -f "${LOG_FILE}" ]]; then
         grep -E "\[ERROR\]|\[WARNING\]|Traceback|Exception" "${LOG_FILE}" | tail -n 40 || echo "В файле логов ошибок не найдено."
     fi
+    if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+        echo ""
+        ${SUDO} journalctl -u "${SERVICE_NAME}" -p err..warning -n 30 --no-pager || true
+    fi
+}
+
+cmd_pulse() {
+    echo -e "${PURPLE}${BOLD}=== 🧩 Интеграция с плагином Pulse (Pterodactyl) ===${NC}"
+    CUSTOM_PTERO_DIR="${1:-}"
+    if [[ -n "${CUSTOM_PTERO_DIR}" ]]; then
+        if grep -qE "^PULSE_BRIDGE_DIRS=" "${ENV_FILE}" 2>/dev/null; then
+            sed -i "s|^PULSE_BRIDGE_DIRS=.*|PULSE_BRIDGE_DIRS=${CUSTOM_PTERO_DIR}|" "${ENV_FILE}"
+        else
+            echo "PULSE_BRIDGE_DIRS=${CUSTOM_PTERO_DIR}" >> "${ENV_FILE}"
+        fi
+        ok "Путь контейнера сохранён в .env: ${CUSTOM_PTERO_DIR}"
+    fi
+
+    "${PYTHON_BIN}" "${APP_DIR}/main.py" --pulse-sync "${CUSTOM_PTERO_DIR}"
+
     echo ""
-    ${SUDO} journalctl -u "${SERVICE_NAME}" -p err..warning -n 30 --no-pager || true
+    echo -e "${CYAN}${BOLD}Как подключить в веб-панели Pulse (если сервер в Pterodactyl):${NC}"
+    echo -e "  1) Если Pterodactyl стоит на ${BOLD}этом же VPS${NC} (/var/lib/pterodactyl/volumes/*):"
+    echo -e "     Мост автоматически создан внутри контейнера по пути ${BOLD}/home/container/pmx-bot${NC}."
+    echo -e "     В веб-панели Pulse просто нажмите ${BOLD}«⚡ Найти и подключить»${NC} (или укажите путь ${BOLD}/home/container/pmx-bot${NC})."
+    echo -e "  2) Если сервер Minecraft находится на ${BOLD}другом хостинге Pterodactyl${NC}:"
+    echo -e "     Выполните ${BOLD}pmx config${NC} и укажите в .env:"
+    echo -e "       ${BOLD}PTERODACTYL_URL=https://адрес-вашей-панели.ru${NC}"
+    echo -e "       ${BOLD}PTERODACTYL_API_KEY=ptlc_ваш_клиентский_ключ_из_аккаунта${NC}"
+    echo -e "     Бот сам создаст папку ${BOLD}/pmx-bot${NC} на удалённом сервере и будет синхронизировать БД каждые 6 сек!"
 }
 
 cmd_backup() {
@@ -181,7 +268,7 @@ cmd_update() {
 
     info "Обновление зависимостей в .venv..."
     "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt" -q
-    chmod +x "${APP_DIR}/botctl.sh" "${APP_DIR}/install.sh"
+    chmod +x "${APP_DIR}/botctl.sh" "${APP_DIR}/install.sh" "${APP_DIR}/main.py"
 
     cmd_restart
     ok "Обновление завершено!"
@@ -206,7 +293,7 @@ cmd_stats() {
         warn "База данных (${DB_FILE}) ещё не создана."
         return
     fi
-    "${APP_DIR}/.venv/bin/python" - <<PYEOF
+    "${PYTHON_BIN}" - <<PYEOF
 import sqlite3
 conn = sqlite3.connect("${DB_FILE}")
 cur = conn.cursor()
@@ -238,7 +325,7 @@ cmd_uninstall() {
     ${SUDO} systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
     ${SUDO} systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
     ${SUDO} rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    ${SUDO} systemctl daemon-reload
+    ${SUDO} systemctl daemon-reload 2>/dev/null || true
     ${SUDO} rm -f "/usr/local/bin/pmx"
     ok "Сервис ${SERVICE_NAME} удалён. Файлы проекта и база данных в ${APP_DIR} сохранены."
 }
@@ -250,6 +337,7 @@ show_help() {
 Команды:
   (без аргументов)  Открыть интерактивное меню управления
   status            Показать статус сервиса, аптайм и размеры файлов
+  pulse [путь]      Подключить и синхронизировать плагин Pulse в Pterodactyl
   start             Запустить бота
   stop              Остановить бота
   restart           Перезапустить бота
@@ -287,9 +375,10 @@ interactive_menu() {
         echo "  9) Обновить бота из Git + бэкап (update)"
         echo " 10) Создать резервную копию БД (backup)"
         echo " 11) Восстановить из резервной копии (restore)"
+        echo " 12) Интеграция с плагином Pulse / Pterodactyl (pulse)"
         echo "  0) Выход"
         echo "----------------------------------------------------"
-        read -r -p "Выберите действие [0-11]: " CHOICE
+        read -r -p "Выберите действие [0-12]: " CHOICE
         echo ""
         case "${CHOICE}" in
             1) cmd_status ;;
@@ -303,6 +392,7 @@ interactive_menu() {
             9) cmd_update ;;
             10) cmd_backup ;;
             11) cmd_restore ;;
+            12) cmd_pulse ;;
             0|q|exit) exit 0 ;;
             *) warn "Неверный пункт меню." ;;
         esac
@@ -315,6 +405,7 @@ shift || true
 case "${ACTION}" in
     menu)      interactive_menu ;;
     status)    cmd_status ;;
+    pulse)     cmd_pulse "${1:-}" ;;
     start)     cmd_start ;;
     stop)      cmd_stop ;;
     restart)   cmd_restart ;;

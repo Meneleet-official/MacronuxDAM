@@ -43,3 +43,17 @@ DEFAULT_STRIKE_THRESHOLDS = {
     "5": "ban",
     "6": "ban",
 }
+
+# Интеграция с веб-панелью плагина Pulse (включая серверы в Pterodactyl)
+PULSE_ENABLED = os.getenv("PULSE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+PULSE_API_HOST = os.getenv("PULSE_API_HOST", "0.0.0.0").strip()
+PULSE_API_PORT = int(os.getenv("PULSE_API_PORT") or "8765")
+PULSE_API_TOKEN = os.getenv("PULSE_API_TOKEN", "").strip()
+# Дополнительные пути к папкам контейнеров Pterodactyl (через запятую или ;)
+PULSE_BRIDGE_DIRS = os.getenv("PULSE_BRIDGE_DIRS", "").strip()
+
+# Подключение к удалённому серверу Minecraft через Pterodactyl Client API (если сервер на другом хостинге)
+PTERODACTYL_URL = os.getenv("PTERODACTYL_URL", "").strip().rstrip("/")
+PTERODACTYL_API_KEY = os.getenv("PTERODACTYL_API_KEY", "").strip()
+PTERODACTYL_SERVER_ID = os.getenv("PTERODACTYL_SERVER_ID", "").strip()
+
