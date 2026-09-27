@@ -139,26 +139,42 @@ class ReportsCog(commands.Cog):
         rule_id = rule_hint if rule_hint in RULES else "3.1"
         rule_title = RULES.get(rule_id, {}).get("title", "Жалоба участника")
 
+        try:
+            db.record_discord_member(interaction.guild.id, interaction.user)
+            target_meta = db.record_discord_member(interaction.guild.id, target_user)
+        except Exception:
+            target_meta = {}
+
         msg_content = (target_message.content if target_message else "") or ""
         snapshot = (
             f"[Жалоба от {interaction.user} (reporter_id={interaction.user.id})]: {reason_text}"
             + (f" | Сообщение: {msg_content}" if msg_content else "")
         )
-        orig_ch_id = target_message.channel.id if target_message else interaction.channel.id
+        orig_ch = target_message.channel if target_message else interaction.channel
+        orig_ch_id = orig_ch.id if orig_ch else 0
+        orig_ch_name = getattr(orig_ch, "name", None)
         orig_msg_id = target_message.id if target_message else 0
+        jump_url = getattr(target_message, "jump_url", None) if target_message else None
 
         violation_id = db.add_violation(
             interaction.guild.id,
             target_user.id,
+            guild_name=interaction.guild.name,
+            user_name=target_meta.get("username"),
+            user_display_name=target_meta.get("display_name"),
+            user_avatar_url=target_meta.get("avatar_url"),
             rule_id=rule_id,
             severity="medium",
             method="user_report",
+            reason=reason_text[:300],
             message_snapshot=snapshot[:500],
             original_text=snapshot[:500],
             translated_text=None,
             detected_language="ru",
             channel_id=orig_ch_id,
+            channel_name=orig_ch_name,
             message_id=orig_msg_id,
+            jump_url=jump_url,
         )
 
         violations_n = db.count_real_violations(interaction.guild.id, target_user.id)

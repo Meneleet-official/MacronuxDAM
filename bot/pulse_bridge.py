@@ -32,7 +32,7 @@ import discord
 import httpx
 
 import config
-from bot.database import SCHEMA, get_db
+from bot.database import SCHEMA, get_db, migrate_conn
 from bot.logger import get_logger
 from bot.rules import RULES
 
@@ -110,6 +110,7 @@ class PulseBridge:
         self._processed_web_punishments: set[int] = set()
         self._http_server: Optional[asyncio.AbstractServer] = None
         self._docker_agent_checked_at: float = 0.0
+        self._meta_synced_at: float = 0.0
         self._remote_sync_at: float = 0.0
         self._discovered_Server_id: str = config.PTERODACTYL_SERVER_ID
 
@@ -477,13 +478,16 @@ class PulseBridge:
     # ------------------------------------------------------------------
     def sync_all_local_bridges(self) -> list[str]:
         """Синхронизирует основную БД бота со всеми найденными контейнерами Pterodactyl / папками Pulse."""
-        # Гарантируем, что все текущие серверы Discord записаны в таблицу servers основной БД
-        try:
-            db = get_db()
-            for g in list(getattr(self.bot, "guilds", [])):
-                db.get_server(g.id)
-        except Exception:
-            pass
+        # Гарантируем, что все текущие серверы Discord, их каналы, роли и профили записаны в основную БД
+        now = time.time()
+        if now - self._meta_synced_at >= 30.0:
+            self._meta_synced_at = now
+            try:
+                from bot.client import sync_guild_discord_metadata
+                for g in list(getattr(self.bot, "guilds", [])):
+                    sync_guild_discord_metadata(g)
+            except Exception:
+                pass
 
         synced_paths: list[str] = []
         for target_dir in self.discover_bridge_targets():
@@ -523,12 +527,18 @@ class PulseBridge:
         bridge_conn.row_factory = sqlite3.Row
 
         try:
-            bridge_conn.executescript(SCHEMA)
-            try:
-                bridge_conn.execute("ALTER TABLE servers ADD COLUMN mod_role_id INTEGER")
-            except sqlite3.OperationalError:
-                pass
-            bridge_conn.commit()
+            migrate_conn(main_conn)
+            migrate_conn(bridge_conn)
+
+            def _srv_cfg_sig(row_dict: dict[str, Any]) -> tuple:
+                return (
+                    row_dict.get("mod_channel_id"),
+                    row_dict.get("mod_role_id"),
+                    row_dict.get("target_language") or "ru",
+                    int(row_dict.get("delete_message") or 0),
+                    int(row_dict.get("llm_enabled") if row_dict.get("llm_enabled") is not None else 1),
+                    int(row_dict.get("manual_strikes") or 0),
+                )
 
             # --- ШАГ 1: Если снимок уже инициализирован, применяем изменения из веб-панели Pulse в основную БД ---
             if snap.initialized:
@@ -537,9 +547,9 @@ class PulseBridge:
                     int(r["guild_id"]): dict(r)
                     for r in bridge_conn.execute("SELECT * FROM servers").fetchall()
                 }
-                for gid, b_row in b_servers.items():
-                    old_row = snap.servers.get(gid)
-                    if old_row != b_row:
+                for gid_val, b_row in b_servers.items():
+                    old_row = snap.servers.get(gid_val)
+                    if old_row is None or _srv_cfg_sig(old_row) != _srv_cfg_sig(b_row):
                         main_conn.execute(
                             """INSERT INTO servers (guild_id, mod_channel_id, mod_role_id, target_language,
                                                     delete_message, llm_enabled, strike_thresholds, manual_strikes)
@@ -552,7 +562,7 @@ class PulseBridge:
                                    llm_enabled = excluded.llm_enabled,
                                    manual_strikes = excluded.manual_strikes""",
                             (
-                                gid,
+                                gid_val,
                                 b_row.get("mod_channel_id"),
                                 b_row.get("mod_role_id"),
                                 b_row.get("target_language") or "ru",
@@ -593,11 +603,16 @@ class PulseBridge:
                         main_conn.execute("DELETE FROM punishments WHERE violation_id = ?", (vid,))
                         main_conn.execute(
                             """INSERT INTO punishments
-                               (guild_id, user_id, violation_id, moderator_id, action, duration_seconds, status, created_at)
-                               VALUES (?, ?, ?, 0, ?, ?, ?, ?)""",
+                               (guild_id, user_id, user_name, user_display_name, user_avatar_url,
+                                violation_id, moderator_id, moderator_name, moderator_display_name,
+                                action, duration_seconds, status, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, 0, 'pulse_web', 'Веб-панель Pulse', ?, ?, ?, ?)""",
                             (
                                 pr["guild_id"],
                                 pr["user_id"],
+                                pr["user_name"],
+                                pr["user_display_name"],
+                                pr["user_avatar_url"],
                                 vid,
                                 pr["action"],
                                 pr["duration_seconds"] or 0,
@@ -611,15 +626,15 @@ class PulseBridge:
                     (int(r["guild_id"]), str(r["word"]))
                     for r in bridge_conn.execute("SELECT guild_id, word FROM banned_words").fetchall()
                 }
-                for gid, w in b_words - snap.banwords:
+                for gid_val, w in b_words - snap.banwords:
                     main_conn.execute(
                         "INSERT OR IGNORE INTO banned_words (guild_id, word) VALUES (?, ?)",
-                        (gid, w),
+                        (gid_val, w),
                     )
-                for gid, w in snap.banwords - b_words:
+                for gid_val, w in snap.banwords - b_words:
                     main_conn.execute(
                         "DELETE FROM banned_words WHERE guild_id = ? AND word = ?",
-                        (gid, w),
+                        (gid_val, w),
                     )
 
                 # 1e. Исключения правил по каналам (добавленные/удалённые в веб-панели Pulse)
@@ -629,15 +644,15 @@ class PulseBridge:
                         "SELECT guild_id, channel_id, rule FROM rule_exceptions"
                     ).fetchall()
                 }
-                for gid, cid, rl in b_ex - snap.exceptions:
+                for gid_val, cid, rl in b_ex - snap.exceptions:
                     main_conn.execute(
                         "INSERT OR IGNORE INTO rule_exceptions (guild_id, channel_id, rule) VALUES (?, ?, ?)",
-                        (gid, cid, rl),
+                        (gid_val, cid, rl),
                     )
-                for gid, cid, rl in snap.exceptions - b_ex:
+                for gid_val, cid, rl in snap.exceptions - b_ex:
                     main_conn.execute(
                         "DELETE FROM rule_exceptions WHERE guild_id = ? AND channel_id = ? AND rule = ?",
-                        (gid, cid, rl),
+                        (gid_val, cid, rl),
                     )
 
                 main_conn.commit()
@@ -674,85 +689,207 @@ class PulseBridge:
                 main_conn.commit()
 
             # --- ШАГ 2: Зеркалируем актуальное состояние основной БД в БД контейнера Pterodactyl ---
-            # 2a. servers
+            # 2a. servers (включая название сервера, иконку, число участников, названия канала и роли модерации)
             m_servers = [dict(r) for r in main_conn.execute("SELECT * FROM servers").fetchall()]
             for r in m_servers:
                 bridge_conn.execute(
-                    """INSERT INTO servers (guild_id, mod_channel_id, mod_role_id, target_language,
-                                            delete_message, llm_enabled, strike_thresholds, manual_strikes)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """INSERT INTO servers (
+                           guild_id, guild_name, guild_icon_url, member_count,
+                           mod_channel_id, mod_channel_name, mod_role_id, mod_role_name,
+                           target_language, delete_message, llm_enabled, strike_thresholds,
+                           manual_strikes, updated_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(guild_id) DO UPDATE SET
+                           guild_name = COALESCE(excluded.guild_name, servers.guild_name),
+                           guild_icon_url = COALESCE(excluded.guild_icon_url, servers.guild_icon_url),
+                           member_count = COALESCE(excluded.member_count, servers.member_count),
                            mod_channel_id = excluded.mod_channel_id,
+                           mod_channel_name = COALESCE(excluded.mod_channel_name, servers.mod_channel_name),
                            mod_role_id = excluded.mod_role_id,
+                           mod_role_name = COALESCE(excluded.mod_role_name, servers.mod_role_name),
                            target_language = excluded.target_language,
                            delete_message = excluded.delete_message,
                            llm_enabled = excluded.llm_enabled,
                            strike_thresholds = excluded.strike_thresholds,
-                           manual_strikes = excluded.manual_strikes""",
+                           manual_strikes = excluded.manual_strikes,
+                           updated_at = excluded.updated_at""",
                     (
                         r["guild_id"],
+                        r.get("guild_name"),
+                        r.get("guild_icon_url"),
+                        r.get("member_count") or 0,
                         r["mod_channel_id"],
+                        r.get("mod_channel_name"),
                         r.get("mod_role_id"),
+                        r.get("mod_role_name"),
                         r["target_language"],
                         r["delete_message"],
                         r["llm_enabled"],
                         r["strike_thresholds"],
                         r["manual_strikes"],
+                        r.get("updated_at"),
                     ),
                 )
 
-            # 2b. violations
+            # 2b. violations (с полными метаданными пользователя, аватаркой, каналом, причиной и ссылкой)
             m_viols = [dict(r) for r in main_conn.execute("SELECT * FROM violations").fetchall()]
             m_vid_set = {int(r["id"]) for r in m_viols}
             b_vid_set = {int(r["id"]) for r in bridge_conn.execute("SELECT id FROM violations").fetchall()}
             for r in m_viols:
-                if int(r["id"]) not in b_vid_set:
-                    bridge_conn.execute(
-                        """INSERT INTO violations
-                           (id, guild_id, user_id, rule_id, severity, method, message_snapshot,
-                            original_text, translated_text, detected_language, channel_id, message_id, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            r["id"],
-                            r["guild_id"],
-                            r["user_id"],
-                            r["rule_id"],
-                            r["severity"],
-                            r["method"],
-                            r["message_snapshot"],
-                            r["original_text"],
-                            r["translated_text"],
-                            r["detected_language"],
-                            r["channel_id"],
-                            r["message_id"],
-                            r["created_at"],
-                        ),
-                    )
+                bridge_conn.execute(
+                    """INSERT INTO violations (
+                           id, guild_id, guild_name, user_id, user_name, user_display_name, user_avatar_url,
+                           rule_id, severity, method, reason, message_snapshot,
+                           original_text, translated_text, detected_language,
+                           channel_id, channel_name, message_id, jump_url, attachments_json, created_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           guild_name = COALESCE(excluded.guild_name, violations.guild_name),
+                           user_name = COALESCE(excluded.user_name, violations.user_name),
+                           user_display_name = COALESCE(excluded.user_display_name, violations.user_display_name),
+                           user_avatar_url = COALESCE(excluded.user_avatar_url, violations.user_avatar_url),
+                           reason = COALESCE(excluded.reason, violations.reason),
+                           channel_name = COALESCE(excluded.channel_name, violations.channel_name),
+                           jump_url = COALESCE(excluded.jump_url, violations.jump_url),
+                           attachments_json = COALESCE(excluded.attachments_json, violations.attachments_json)""",
+                    (
+                        r["id"],
+                        r["guild_id"],
+                        r.get("guild_name"),
+                        r["user_id"],
+                        r.get("user_name"),
+                        r.get("user_display_name"),
+                        r.get("user_avatar_url"),
+                        r["rule_id"],
+                        r["severity"],
+                        r["method"],
+                        r.get("reason"),
+                        r["message_snapshot"],
+                        r["original_text"],
+                        r["translated_text"],
+                        r["detected_language"],
+                        r["channel_id"],
+                        r.get("channel_name"),
+                        r["message_id"],
+                        r.get("jump_url"),
+                        r.get("attachments_json"),
+                        r["created_at"],
+                    ),
+                )
             for stale_vid in b_vid_set - m_vid_set:
                 bridge_conn.execute("DELETE FROM violations WHERE id = ?", (stale_vid,))
 
-            # 2c. punishments
+            # 2c. punishments (с именами и аватарками нарушителей и модераторов)
             m_puns = [dict(r) for r in main_conn.execute("SELECT * FROM punishments ORDER BY id ASC").fetchall()]
             bridge_conn.execute("DELETE FROM punishments")
             for r in m_puns:
                 bridge_conn.execute(
-                    """INSERT INTO punishments
-                       (id, guild_id, user_id, violation_id, moderator_id, action, duration_seconds, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO punishments (
+                           id, guild_id, user_id, user_name, user_display_name, user_avatar_url,
+                           violation_id, moderator_id, moderator_name, moderator_display_name, moderator_avatar_url,
+                           action, duration_seconds, reason, status, created_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         r["id"],
                         r["guild_id"],
                         r["user_id"],
+                        r.get("user_name"),
+                        r.get("user_display_name"),
+                        r.get("user_avatar_url"),
                         r["violation_id"],
                         r["moderator_id"],
+                        r.get("moderator_name"),
+                        r.get("moderator_display_name"),
+                        r.get("moderator_avatar_url"),
                         r["action"],
                         r["duration_seconds"],
+                        r.get("reason"),
                         r["status"],
                         r["created_at"],
                     ),
                 )
 
-            # 2d. banned_words & rule_exceptions
+            # 2d. users, channels, roles
+            m_users = [dict(r) for r in main_conn.execute("SELECT * FROM users").fetchall()]
+            for r in m_users:
+                bridge_conn.execute(
+                    """INSERT INTO users (
+                           guild_id, user_id, username, global_name, display_name, avatar_url,
+                           language, account_created_at, joined_at, top_role_name, top_role_color,
+                           roles_json, is_bot, is_moderator, updated_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                           username = COALESCE(excluded.username, users.username),
+                           global_name = COALESCE(excluded.global_name, users.global_name),
+                           display_name = COALESCE(excluded.display_name, users.display_name),
+                           avatar_url = COALESCE(excluded.avatar_url, users.avatar_url),
+                           language = COALESCE(excluded.language, users.language),
+                           account_created_at = COALESCE(excluded.account_created_at, users.account_created_at),
+                           joined_at = COALESCE(excluded.joined_at, users.joined_at),
+                           top_role_name = COALESCE(excluded.top_role_name, users.top_role_name),
+                           top_role_color = COALESCE(excluded.top_role_color, users.top_role_color),
+                           roles_json = COALESCE(excluded.roles_json, users.roles_json),
+                           is_bot = excluded.is_bot,
+                           is_moderator = excluded.is_moderator,
+                           updated_at = excluded.updated_at""",
+                    (
+                        r["guild_id"],
+                        r["user_id"],
+                        r.get("username"),
+                        r.get("global_name"),
+                        r.get("display_name"),
+                        r.get("avatar_url"),
+                        r.get("language"),
+                        r.get("account_created_at"),
+                        r.get("joined_at"),
+                        r.get("top_role_name"),
+                        r.get("top_role_color"),
+                        r.get("roles_json"),
+                        r.get("is_bot") or 0,
+                        r.get("is_moderator") or 0,
+                        r.get("updated_at"),
+                    ),
+                )
+
+            m_channels = [dict(r) for r in main_conn.execute("SELECT * FROM channels").fetchall()]
+            bridge_conn.execute("DELETE FROM channels")
+            for r in m_channels:
+                bridge_conn.execute(
+                    """INSERT INTO channels (channel_id, guild_id, name, type, category_name, position, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        r["channel_id"],
+                        r["guild_id"],
+                        r["name"],
+                        r.get("type") or "text",
+                        r.get("category_name"),
+                        r.get("position") or 0,
+                        r.get("updated_at"),
+                    ),
+                )
+
+            m_roles = [dict(r) for r in main_conn.execute("SELECT * FROM roles").fetchall()]
+            bridge_conn.execute("DELETE FROM roles")
+            for r in m_roles:
+                bridge_conn.execute(
+                    """INSERT INTO roles (role_id, guild_id, name, color, position, is_staff, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        r["role_id"],
+                        r["guild_id"],
+                        r["name"],
+                        r.get("color"),
+                        r.get("position") or 0,
+                        r.get("is_staff") or 0,
+                        r.get("updated_at"),
+                    ),
+                )
+
+            # 2e. banned_words & rule_exceptions
             m_words = [dict(r) for r in main_conn.execute("SELECT * FROM banned_words").fetchall()]
             bridge_conn.execute("DELETE FROM banned_words")
             for r in m_words:
@@ -1170,18 +1307,24 @@ class PulseBridge:
             g_rows = conn.execute("SELECT * FROM servers").fetchall()
             guilds = []
             for gr in g_rows:
+                gr_d = dict(gr)
                 vc = conn.execute(
                     "SELECT COUNT(*) AS c FROM violations WHERE guild_id = ?",
-                    (gr["guild_id"],),
+                    (gr_d["guild_id"],),
                 ).fetchone()["c"]
                 guilds.append({
-                    "guildId": str(gr["guild_id"]),
-                    "modChannelId": str(gr["mod_channel_id"] or ""),
-                    "modRoleId": str(gr["mod_role_id"] or ""),
-                    "targetLanguage": gr["target_language"] or "ru",
-                    "deleteMessage": bool(gr["delete_message"]),
-                    "llmEnabled": bool(gr["llm_enabled"]),
-                    "manualStrikes": bool(gr["manual_strikes"]),
+                    "guildId": str(gr_d["guild_id"]),
+                    "guildName": gr_d.get("guild_name") or "",
+                    "guildIconUrl": gr_d.get("guild_icon_url") or "",
+                    "memberCount": int(gr_d.get("member_count") or 0),
+                    "modChannelId": str(gr_d.get("mod_channel_id") or ""),
+                    "modChannelName": gr_d.get("mod_channel_name") or "",
+                    "modRoleId": str(gr_d.get("mod_role_id") or ""),
+                    "modRoleName": gr_d.get("mod_role_name") or "",
+                    "targetLanguage": gr_d.get("target_language") or "ru",
+                    "deleteMessage": bool(gr_d.get("delete_message")),
+                    "llmEnabled": bool(gr_d.get("llm_enabled")),
+                    "manualStrikes": bool(gr_d.get("manual_strikes")),
                     "violationsCount": vc,
                 })
             out["guilds"] = guilds
@@ -1195,6 +1338,30 @@ class PulseBridge:
                     "skippedCount": dstats["skipped"],
                     "punishedCount": sum(dstats["actions"].values()),
                 }
+                out["channels"] = [
+                    {
+                        "channelId": str(r["channel_id"]),
+                        "name": r["name"],
+                        "type": r["type"] or "text",
+                        "categoryName": r["category_name"] or "",
+                    }
+                    for r in conn.execute(
+                        "SELECT * FROM channels WHERE guild_id = ? ORDER BY position ASC",
+                        (gid,),
+                    ).fetchall()
+                ]
+                out["roles"] = [
+                    {
+                        "roleId": str(r["role_id"]),
+                        "name": r["name"],
+                        "color": r["color"] or "",
+                        "isStaff": bool(r["is_staff"]),
+                    }
+                    for r in conn.execute(
+                        "SELECT * FROM roles WHERE guild_id = ? ORDER BY position DESC",
+                        (gid,),
+                    ).fetchall()
+                ]
         return out
 
     def _handle_api_action(self, body: dict[str, Any]) -> dict[str, Any]:

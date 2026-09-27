@@ -479,12 +479,20 @@ class ModActionView(ui.View):
         from bot.database import get_db
         from bot.telemetry import log_event
         db = get_db()
+        mod_meta = {}
+        try:
+            mod_meta = db.record_discord_member(self.guild_id, interaction.user)
+        except Exception:
+            pass
         punishment_id = None
         try:
             punishment_id = db.add_punishment(
                 self.guild_id, self.user_id,
                 violation_id=self.violation_id,
                 moderator_id=interaction.user.id,
+                moderator_name=mod_meta.get("username"),
+                moderator_display_name=mod_meta.get("display_name"),
+                moderator_avatar_url=mod_meta.get("avatar_url"),
                 action=action,
                 duration_seconds=duration_seconds,
                 status=status,
@@ -506,9 +514,16 @@ class ModActionView(ui.View):
             log_event(
                 "moderator_action",
                 guild_id=self.guild_id,
+                guild_name=getattr(interaction.guild, "name", None) or (v.get("guild_name") if v else None),
                 user_id=self.user_id,
+                user_name=v.get("user_name") if v else None,
+                user_display_name=v.get("user_display_name") if v else None,
+                user_avatar_url=v.get("user_avatar_url") if v else None,
                 violation_id=self.violation_id,
                 moderator_id=interaction.user.id,
+                moderator_name=mod_meta.get("username"),
+                moderator_display_name=mod_meta.get("display_name"),
+                moderator_avatar_url=mod_meta.get("avatar_url"),
                 action=action,
                 duration_seconds=duration_seconds,
                 status=status,

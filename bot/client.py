@@ -327,6 +327,10 @@ class ModBot(commands.Bot):
             self.loop.create_task(self._backfill_scan())
             self.loop.create_task(self._process_expired_bans())
         for guild in self.guilds:
+            try:
+                sync_guild_discord_metadata(guild)
+            except Exception as e:
+                print(f"[META] ошибка синхронизации метаданных сервера {guild.id}: {e}")
             server = get_db().get_server(guild.id)
             print(f"  Сервер: {guild.name} (id={guild.id}), канал модерации: "
                   f"{server.get('mod_channel_id')}, язык: {server.get('target_language')}")
@@ -337,9 +341,54 @@ class ModBot(commands.Bot):
                 else:
                     print(f"    [НЕ виден] #{ch.name}")
 
+    async def on_guild_join(self, guild: discord.Guild):
+        try:
+            sync_guild_discord_metadata(guild)
+        except Exception as e:
+            print(f"[META] on_guild_join {guild.id}: {e}")
+
+    async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
+        try:
+            sync_guild_discord_metadata(after)
+        except Exception as e:
+            print(f"[META] on_guild_update {after.id}: {e}")
+
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        if getattr(channel, "guild", None):
+            try:
+                sync_guild_discord_metadata(channel.guild)
+            except Exception:
+                pass
+
+    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        if getattr(after, "guild", None) and getattr(before, "name", None) != getattr(after, "name", None):
+            try:
+                sync_guild_discord_metadata(after.guild)
+            except Exception:
+                pass
+
+    async def on_guild_role_create(self, role: discord.Role):
+        if getattr(role, "guild", None):
+            try:
+                sync_guild_discord_metadata(role.guild)
+            except Exception:
+                pass
+
+    async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
+        if getattr(after, "guild", None) and getattr(before, "name", None) != getattr(after, "name", None):
+            try:
+                sync_guild_discord_metadata(after.guild)
+            except Exception:
+                pass
+
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
+        # Сохраняем актуальный никнейм, аватарку и роли участника для веб-панели
+        try:
+            get_db().record_discord_member(message.guild.id, message.author)
+        except Exception:
+            pass
         # В голосовых каналах мониторим нарушения, но команды (слэш- и «!»-) игнорируем.
         is_voice = isinstance(message.channel, (discord.VoiceChannel, discord.StageChannel))
         content = message.content or ""
@@ -382,6 +431,10 @@ class ModBot(commands.Bot):
         """Модерация отредактированных сообщений: защита от обхода через редактирование «Привет» -> скам/оскорбление."""
         if after.author.bot or not after.guild:
             return
+        try:
+            get_db().record_discord_member(after.guild.id, after.author)
+        except Exception:
+            pass
         before_text = (before.content or "").strip()
         after_text = (after.content or "").strip()
         if not after_text or before_text == after_text:
@@ -411,6 +464,10 @@ class ModBot(commands.Bot):
         """Анти-рейд (п. 2.6) и проверка никнейма/профиля при входе (п. 2.2, 2.3, 3.7)."""
         if member.bot or not member.guild:
             return
+        try:
+            get_db().record_discord_member(member.guild.id, member)
+        except Exception:
+            pass
         now = time.time()
         gid = member.guild.id
         joins = RECENT_JOINS[gid]
@@ -436,8 +493,15 @@ class ModBot(commands.Bot):
         after_dn = (getattr(after, "display_name", "") or "").strip()
         before_gn = (getattr(before, "global_name", "") or "").strip()
         after_gn = (getattr(after, "global_name", "") or "").strip()
+        before_av = str(getattr(getattr(before, "display_avatar", None), "url", ""))
+        after_av = str(getattr(getattr(after, "display_avatar", None), "url", ""))
         before_st = moderation._extract_member_status(before)
         after_st = moderation._extract_member_status(after)
+        if before_dn != after_dn or before_gn != after_gn or before_av != after_av:
+            try:
+                get_db().record_discord_member(after.guild.id, after)
+            except Exception:
+                pass
         if before_dn == after_dn and before_gn == after_gn and before_st == after_st:
             return
         await self._check_member_profile_violation(after)
@@ -724,8 +788,106 @@ def _account_age_hours(user) -> float | None:
         return None
 
 
+def sync_guild_discord_metadata(guild: discord.Guild) -> None:
+    """Синхронизирует метаданные сервера (название, иконку, онлайн/участников, список каналов, ролей и профили) с БД."""
+    if guild is None:
+        return
+    import json as _json
+    db = get_db()
+    server = db.get_server(guild.id)
+
+    icon_url = str(guild.icon.url) if getattr(guild, "icon", None) else None
+    member_count = int(getattr(guild, "member_count", None) or len(getattr(guild, "members", ())) or 0)
+    mod_ch_obj = _resolve_mod_channel(guild, server.get("mod_channel_id"))
+    mod_ch_name = getattr(mod_ch_obj, "name", None) if mod_ch_obj else None
+    mod_role_id = server.get("mod_role_id")
+    mod_role_obj = guild.get_role(mod_role_id) if mod_role_id else None
+    mod_role_name = getattr(mod_role_obj, "name", None) if mod_role_obj else None
+
+    db.upsert_guild_metadata(
+        guild_id=guild.id,
+        guild_name=guild.name,
+        guild_icon_url=icon_url,
+        member_count=member_count,
+        mod_channel_name=mod_ch_name,
+        mod_role_name=mod_role_name,
+    )
+
+    channels_list = []
+    for ch in getattr(guild, "channels", ()):
+        if isinstance(ch, discord.CategoryChannel):
+            continue
+        ch_type = "text"
+        if isinstance(ch, discord.VoiceChannel):
+            ch_type = "voice"
+        elif isinstance(ch, discord.StageChannel):
+            ch_type = "stage"
+        elif isinstance(ch, discord.ForumChannel):
+            ch_type = "forum"
+        cat_name = getattr(getattr(ch, "category", None), "name", None)
+        channels_list.append({
+            "channel_id": ch.id,
+            "name": ch.name,
+            "type": ch_type,
+            "category_name": cat_name,
+            "position": getattr(ch, "position", 0),
+        })
+
+    roles_list = []
+    for rl in getattr(guild, "roles", ()):
+        if getattr(rl, "is_default", lambda: False)():
+            continue
+        perms = getattr(rl, "permissions", None)
+        is_staff = 1 if perms and (
+            perms.administrator or perms.moderate_members or perms.manage_messages or perms.ban_members or perms.kick_members
+        ) else 0
+        col_str = str(getattr(rl, "color", ""))
+        roles_list.append({
+            "role_id": rl.id,
+            "name": rl.name,
+            "color": col_str if col_str and col_str != "#000000" else None,
+            "position": getattr(rl, "position", 0),
+            "is_staff": is_staff,
+        })
+
+    db.sync_guild_channels_and_roles(guild.id, channels_list, roles_list)
+
+    # Обогащаем профили всех участников, которые уже фигурируют в нарушениях или наказаниях (а также модераторов)
+    important_uids: set[int] = set()
+    try:
+        with db._session() as conn:
+            for r in conn.execute(
+                "SELECT DISTINCT user_id FROM violations WHERE guild_id = ? UNION SELECT DISTINCT user_id FROM punishments WHERE guild_id = ? UNION SELECT DISTINCT moderator_id FROM punishments WHERE guild_id = ?",
+                (guild.id, guild.id, guild.id),
+            ).fetchall():
+                if r[0]:
+                    important_uids.add(int(r[0]))
+    except Exception:
+        pass
+
+    recorded = 0
+    for uid in important_uids:
+        m = guild.get_member(uid)
+        if m is not None:
+            db.record_discord_member(guild.id, m)
+            recorded += 1
+
+    # Также сохраняем до 300 активных участников/модераторов из кэша гильдии
+    for m in getattr(guild, "members", ()):
+        if m.bot:
+            continue
+        if m.id in important_uids:
+            continue
+        perms = getattr(m, "guild_permissions", None)
+        is_mod = perms and (perms.administrator or perms.moderate_members or perms.manage_messages or perms.ban_members)
+        if is_mod or recorded < 300:
+            db.record_discord_member(guild.id, m)
+            recorded += 1
+
+
 async def post_violation_panel(message, server, rule_id, method, severity, reason,
                                target_lang, delete_msg, mod_channel_id, translation=None):
+    import json as _json
     db = get_db()
     guild = message.guild
 
@@ -756,17 +918,36 @@ async def post_violation_panel(message, server, rule_id, method, severity, reaso
         translated = await translator.translate(message.content, target_lang)
         detected_lang = translator.detect_language(message.content)
 
+    # Сохраняем актуальный профиль автора и метаданные сообщения
+    user_meta = db.record_discord_member(guild.id, message.author)
+    ch_name = getattr(message.channel, "name", None)
+    jump_url = getattr(message, "jump_url", None)
+    attachments_list = [
+        {"url": str(a.url), "filename": getattr(a, "filename", ""), "content_type": getattr(a, "content_type", None)}
+        for a in getattr(message, "attachments", ()) or ()
+        if getattr(a, "url", None)
+    ]
+    attachments_json = _json.dumps(attachments_list, ensure_ascii=False) if attachments_list else None
+
     violation_id = db.add_violation(
         guild.id, message.author.id,
+        guild_name=guild.name,
+        user_name=user_meta.get("username"),
+        user_display_name=user_meta.get("display_name"),
+        user_avatar_url=user_meta.get("avatar_url"),
         rule_id=rule_id,
         severity=severity,
         method=method,
+        reason=reason,
         message_snapshot=message.content,
         original_text=message.content,
         translated_text=translated,
         detected_language=detected_lang,
         channel_id=message.channel.id,
+        channel_name=ch_name,
         message_id=message.id,
+        jump_url=jump_url,
+        attachments_json=attachments_json,
     )
 
     # Число нарушений (реальные, без «пропущенных») — для эскалации наказания
@@ -870,8 +1051,13 @@ async def post_violation_panel(message, server, rule_id, method, severity, reaso
         log_event(
             "violation_detected",
             guild_id=guild.id,
+            guild_name=guild.name,
             channel_id=message.channel.id,
+            channel_name=ch_name,
             user_id=message.author.id,
+            user_name=user_meta.get("username"),
+            user_display_name=user_meta.get("display_name"),
+            user_avatar_url=user_meta.get("avatar_url"),
             violation_id=violation_id,
             rule_id=rule_id,
             severity=severity,
@@ -880,6 +1066,7 @@ async def post_violation_panel(message, server, rule_id, method, severity, reaso
             detected_language=detected_lang,
             text=message.content or None,
             translated_text=translated or None,
+            jump_url=jump_url,
             emergency=emergency,
         )
     except Exception as e:
@@ -956,6 +1143,7 @@ async def post_profile_violation_panel(
     if channel is None:
         return
 
+    user_meta = db.record_discord_member(guild.id, member)
     lang = server.get("target_language") or "ru"
     shown_name = old_display_name or member.display_name
     status_text = moderation._extract_member_status(member)
@@ -967,14 +1155,20 @@ async def post_profile_violation_panel(
 
     violation_id = db.add_violation(
         guild.id, member.id,
+        guild_name=guild.name,
+        user_name=user_meta.get("username"),
+        user_display_name=shown_name,
+        user_avatar_url=user_meta.get("avatar_url"),
         rule_id=rule_id,
         severity=severity,
         method=method,
+        reason=reason,
         message_snapshot=profile_snapshot,
         original_text=profile_snapshot,
         translated_text=None,
         detected_language="ru",
         channel_id=channel.id,
+        channel_name=getattr(channel, "name", None),
         message_id=0,
     )
     violations_n = db.count_real_violations(guild.id, member.id)
@@ -1047,6 +1241,7 @@ async def post_raid_alert_panel(guild: discord.Guild, trigger_member: discord.Me
     if channel is None:
         return
 
+    user_meta = db.record_discord_member(guild.id, trigger_member)
     raider_lines = [f"• <@{uid}> (`{name}`)" for _, uid, name in raiders[-15:]]
     snapshot = f"Массовый вход ({len(raiders)} чел. за {RAID_WINDOW} сек.): " + ", ".join(
         name for _, _, name in raiders[-10:]
@@ -1054,14 +1249,20 @@ async def post_raid_alert_panel(guild: discord.Guild, trigger_member: discord.Me
 
     violation_id = db.add_violation(
         guild.id, trigger_member.id,
+        guild_name=guild.name,
+        user_name=user_meta.get("username"),
+        user_display_name=user_meta.get("display_name"),
+        user_avatar_url=user_meta.get("avatar_url"),
         rule_id="2.6",
         severity="high",
         method="raid_detector",
+        reason=f"Всплеск входов: {len(raiders)} чел. за {RAID_WINDOW} сек.",
         message_snapshot=snapshot[:500],
         original_text=snapshot[:500],
         translated_text=None,
         detected_language="ru",
         channel_id=channel.id,
+        channel_name=getattr(channel, "name", None),
         message_id=0,
     )
     from bot.rules import RULES
