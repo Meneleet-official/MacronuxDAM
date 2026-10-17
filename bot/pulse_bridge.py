@@ -1327,7 +1327,7 @@ class PulseBridge:
             try:
                 from bot.moderation import mark_phrase_dismissed
                 if orig_text:
-                    mark_phrase_dismissed(orig_text, rule_id)
+                    mark_phrase_dismissed(orig_text, rule_id, guild_id=guild_id)
                 log.info("[PULSE] Нарушение #%d снято через веб-панель Pulse (фраза добавлена в исключения ИИ).", violation_id)
             except Exception as e:
                 log.debug("[PULSE] Ошибка mark_phrase_dismissed: %s", e)

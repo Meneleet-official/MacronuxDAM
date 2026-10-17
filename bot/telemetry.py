@@ -73,8 +73,8 @@ def load_dismissed_examples(guild_id: int | None = None, limit: int = 12) -> lis
     except Exception:
         pass
 
-    # 2. Из кэша телеметрии (сначала для конкретного сервера, затем общие)
-    for key in (guild_id, None):
+    # Общий кэш содержит примеры всех серверов и годится только для запроса без guild_id.
+    for key in (guild_id,):
         buf = _DISMISSED_CACHE.get(key)
         if not buf:
             continue

@@ -411,16 +411,19 @@ class ModBot(commands.Bot):
         # Flood: удаление после 3-го одинакового сообщения, страйк после 5-го (§5.0)
         flood_n = flood_count(message)
         pre_detect = None
-        if flood_n >= 5:
-            pre_detect = ("3.6", "regex", "low", f"Флуд: {flood_n} одинаковых сообщений",
-                          None)
-        elif flood_n >= 3:
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
-            SCAN_PROGRESS[(message.guild.id, message.channel.id)] = message.id
-            return
+        if flood_n >= 3:
+            excluded = set(get_db().list_rule_exceptions(message.guild.id, message.channel.id))
+            if "all" not in excluded and "3.6" not in excluded:
+                if flood_n >= 5:
+                    pre_detect = ("3.6", "regex", "low", f"Флуд: {flood_n} одинаковых сообщений",
+                                  None)
+                else:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException:
+                        pass
+                    SCAN_PROGRESS[(message.guild.id, message.channel.id)] = message.id
+                    return
 
         if self._bg_tasks and not self._mod_queue.full():
             self._mod_queue.put_nowait((message, pre_detect))
@@ -552,7 +555,14 @@ class ModBot(commands.Bot):
         server = db.get_server(message.guild.id)
         mod_channel = server.get("mod_channel_id")
 
-        detect = pre_detect if pre_detect is not None else await detect_violation(message, server)
+        if pre_detect is not None:
+            excluded = set(db.list_rule_exceptions(message.guild.id, message.channel.id))
+            if "all" in excluded or pre_detect[0] in excluded:
+                detect = await detect_violation(message, server)
+            else:
+                detect = pre_detect
+        else:
+            detect = await detect_violation(message, server)
         if detect is None:
             SCAN_PROGRESS[(message.guild.id, message.channel.id)] = message.id
             return
@@ -627,19 +637,39 @@ def build_message_context(message: discord.Message) -> tuple[str, str]:
     msg_id = getattr(message, "id", None)
     cur_text = (message.content or "").strip()
 
-    # Собираем предыдущие реплики этого автора в этом же канале
+    # Собираем только сообщения, которые действительно предшествуют текущему.
     prev_short = []
     prev_for_llm = []
     for rec in recent:
-        if rec.get("channel") != ch_id or rec.get("id") == msg_id:
+        if rec.get("channel") != ch_id:
             continue
+
+        rec_id = rec.get("id")
+        id_order_known = False
+        if msg_id is not None and rec_id is not None:
+            try:
+                if int(rec_id) >= int(msg_id):
+                    continue
+                id_order_known = True
+            except (TypeError, ValueError):
+                pass
+
+        rec_time = rec.get("time")
+        if rec_time is None:
+            continue
+        try:
+            age = now - float(rec_time)
+        except (TypeError, ValueError):
+            continue
+        if age < 0 or (age == 0 and not id_order_known):
+            continue
+
         raw_txt = (rec.get("raw") or rec.get("content") or "").strip()
         if not raw_txt:
             continue
-        dt = abs(now - (rec.get("time") or now))
-        if dt <= SPLIT_MSG_WINDOW:
+        if age <= SPLIT_MSG_WINDOW:
             prev_short.append(raw_txt)
-        if dt <= 60:
+        if age <= 60:
             prev_for_llm.append(raw_txt)
 
     combined_parts = prev_short[-3:] + ([cur_text] if cur_text else [])
@@ -682,7 +712,8 @@ async def detect_violation(message: discord.Message, server) -> tuple | None:
         return rule_id not in excluded
 
     # 1. Regex layer на само сообщение
-    regex_res = moderation.regex_check(text, guild_banwords)
+    regex_res = moderation.regex_check(
+        text, guild_banwords, guild_id=message.guild.id)
     if regex_res and regex_res.detected() and allowed(regex_res.rule_id):
         return (regex_res.rule_id, regex_res.method, regex_res.severity,
                 regex_res.reason, None)
@@ -690,13 +721,14 @@ async def detect_violation(message: discord.Message, server) -> tuple | None:
     # 2. Защита от дробления («ты» / «полный» / «дегенерат») — проверяем склейку последних коротких реплик автора
     combined_recent_text, llm_context = build_message_context(message)
     if combined_recent_text and combined_recent_text.lower() != text.strip().lower():
-        split_res = moderation.regex_check(combined_recent_text, guild_banwords)
+        split_res = moderation.split_banword_check(
+            combined_recent_text, text, guild_banwords)
         if split_res and split_res.detected() and allowed(split_res.rule_id):
             return (
                 split_res.rule_id,
                 split_res.method,
                 split_res.severity,
-                f"{split_res.reason} (разбито на сообщения: «{combined_recent_text[:120]}»)",
+                f"{split_res.reason} (слово разделено между текущим и предыдущими сообщениями)",
                 None,
             )
 

@@ -507,7 +507,8 @@ class ModActionView(ui.View):
         if action == "dismiss" and v:
             try:
                 from bot.moderation import mark_phrase_dismissed
-                mark_phrase_dismissed(v.get("original_text") or "", v.get("rule_id"))
+                mark_phrase_dismissed(v.get("original_text") or "", v.get("rule_id"),
+                                     guild_id=self.guild_id)
             except Exception as e:
                 print(f"[DISMISS] mark_phrase_dismissed: {e}")
         try:
